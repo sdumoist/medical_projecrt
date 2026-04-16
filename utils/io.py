@@ -114,7 +114,10 @@ def save_nifti(data, affine, path):
 
 
 def load_mask(exam_id, dataset_id):
-    """Load nnUNet mask for a case."""
+    """Load nnUNet mask for a case, normalized to [Z, H, W].
+
+    Returns (mask_zhw, affine) or (None, None).
+    """
     mask_folder = "Dataset%03d_*_best_pred" % dataset_id
     mask_dir = os.path.join(NNUNET_ROOT, mask_folder)
     if not os.path.exists(mask_dir):
@@ -128,7 +131,8 @@ def load_mask(exam_id, dataset_id):
 
     mask_path = os.path.join(mask_dir, "%s.nii.gz" % exam_id)
     if os.path.exists(mask_path):
-        return load_nifti(mask_path)
+        data, affine = load_nifti(mask_path)
+        return normalize_axes(data), affine
     return None, None
 
 

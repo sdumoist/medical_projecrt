@@ -496,11 +496,28 @@ def build_loc_cache(
         save_path = os.path.join(output_dir, "%s.pt" % exam_id)
 
         if not overwrite and os.path.exists(save_path):
-            placeholder_masks = {d: None for d in diseases}
-            placeholder_ks = {d: -1 for d in diseases}
-            index_rows.append(build_loc_cache_index_row(
-                exam_id, save_path, placeholder_ks, {},
-                placeholder_masks, diseases))
+            # Read existing .pt to get accurate index data
+            try:
+                existing = torch.load(save_path, map_location="cpu")
+                ex_ks = existing.get("key_slices", {d: -1 for d in diseases})
+                ex_rb = existing.get("roi_boxes", {})
+                # Reconstruct mask availability from saved tensors
+                ex_masks: Dict[str, Optional[np.ndarray]] = {}
+                for d in diseases:
+                    mt = existing.get("mask", {}).get(d)
+                    if mt is not None:
+                        ex_masks[d] = mt.numpy()
+                    else:
+                        ex_masks[d] = None
+                index_rows.append(build_loc_cache_index_row(
+                    exam_id, save_path, ex_ks, ex_rb, ex_masks, diseases))
+            except Exception:
+                # Fallback: file exists but unreadable
+                placeholder_masks = {d: None for d in diseases}
+                placeholder_ks = {d: -1 for d in diseases}
+                index_rows.append(build_loc_cache_index_row(
+                    exam_id, save_path, placeholder_ks, {},
+                    placeholder_masks, diseases))
             success_count += 1
             continue
 
