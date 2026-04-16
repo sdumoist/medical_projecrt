@@ -1,0 +1,73 @@
+# Project configuration for G1 DenseNet binary classification
+
+# Data config
+data:
+  data_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
+  json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
+  nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
+
+  # Sequences to use
+  sequences:
+    - axial_PD
+    - coronal_PD
+    - coronal_T2WI
+    - sagittal_PD
+    - sagittal_T1WI
+
+  # Diseases
+  diseases:
+    - SST
+    - IST
+    - SSC
+    - LHBT
+    - IGHL
+    - RIPI
+    - GHOA
+
+# Model config
+model:
+  name: "densenet_copas_binary"
+  encoder: "densenet121"
+  pretrained: true
+
+  # Input settings
+  input_spacing: [1.0, 1.0, 1.0]
+  crop_size: [96, 96, 64]  # Reduced for memory
+
+  # Localizer settings (for _L models)
+  use_localizer: false
+  localizer_mode: "key_slice"  # key_slice or roi
+
+# Training config
+training:
+  # Binary classification
+  num_classes: 2
+
+  batch_size: 2
+  num_workers: 0  # 0 for single-threaded data loading
+  max_epochs: 50
+  learning_rate: 0.0001
+
+  # Optimizer
+  optimizer: "adam"
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 5
+
+  # Loss
+  loss: "bce"
+
+  # Early stopping
+  patience: 10
+
+# Validation config
+validation:
+  val_interval: 1
+  save_best: true
+
+# Output config
+output:
+  exp_name: "g1_densenet_binary"
+  output_dir: "outputs/experiments"
+  save_tokens: true
+  tokens_dir: "outputs/tokens"

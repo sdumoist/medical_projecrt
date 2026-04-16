@@ -1,0 +1,55 @@
+# G1 DenseNet binary - larger batch size
+# Run on GPU 2: CUDA_VISIBLE_DEVICES=2 PYTHONPATH=. python train.py --config configs/g1_densenet_binary_bs16.yaml
+
+data:
+  data_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
+  json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
+  nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
+
+  sequences:
+    - axial_PD
+    - coronal_PD
+    - coronal_T2WI
+    - sagittal_PD
+    - sagittal_T1WI
+
+  diseases:
+    - SST
+    - IST
+    - SSC
+    - LHBT
+    - IGHL
+    - RIPI
+    - GHOA
+
+model:
+  name: "densenet_copas_binary"
+  encoder: "densenet121"
+  pretrained: true
+  input_spacing: [1.0, 1.0, 1.0]
+  crop_size: [96, 96, 64]
+  use_localizer: false
+  localizer_mode: "key_slice"
+
+training:
+  num_classes: 2
+  batch_size: 16
+  num_workers: 0
+  max_epochs: 50
+  learning_rate: 0.0001
+  optimizer: "adam"
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 5
+  loss: "bce"
+  patience: 10
+
+validation:
+  val_interval: 1
+  save_best: true
+
+output:
+  exp_name: "g1_densenet_binary_bs16"
+  output_dir: "outputs/experiments"
+  save_tokens: true
+  tokens_dir: "outputs/tokens"

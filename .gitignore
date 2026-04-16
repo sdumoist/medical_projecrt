@@ -1,0 +1,31 @@
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.bin
+
+# Data files
+*.nii
+*.nii.gz
+*.csv
+*.bak
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.eggs/
+*.egg-info/
+
+# Outputs (keep structure, ignore heavy files)
+outputs/experiments/*/
+outputs/tokens/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Env
+.env
