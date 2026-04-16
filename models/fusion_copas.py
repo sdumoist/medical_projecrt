@@ -1,229 +1,142 @@
 """
-CoPAS-style fusion module for multi-sequence MRI.
-Based on CoPAS-main: Co_Plane_Att + Cross_Modal_Att.
+CoPAS-style fusion for shoulder MRI.
+
+CoPlaneAttention:
+    Input:  main_f [B, D, C], co_f1 [B, D, C], co_f2 [B, D, C]
+    Output: [B, C]
+    Main sequence attends to two co-plane sequences along the depth (slice) axis,
+    then aggregates into a single global vector.
+
+CrossModalAttention:
+    Input:  pdw_f [B, C], aux_f [B, C]
+    Output: [B, C]
+    Fuses a PD-weighted feature with an auxiliary modality (T1/T2) feature.
 """
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
+import math
 
 
-def ini_weights(module_list):
-    """Initialize weights."""
-    for m in module_list:
-        if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
-            nn.init.kaiming_normal_(m.weight, mode='fan_out')
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
-        elif isinstance(m, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-            nn.init.constant_(m.weight, 1)
-            nn.init.constant_(m.bias, 0)
-        elif isinstance(m, nn.Linear):
-            nn.init.normal_(m.weight, std=0.001)
-            if m.bias is not None:
-                nn.init.constant_(m.bias, 0)
+def _init_weights(module):
+    if isinstance(module, nn.Linear):
+        nn.init.normal_(module.weight, std=0.001)
+        if module.bias is not None:
+            nn.init.constant_(module.bias, 0)
+    elif isinstance(module, (nn.BatchNorm1d, nn.LayerNorm)):
+        nn.init.constant_(module.weight, 1)
+        nn.init.constant_(module.bias, 0)
 
 
 class CoPlaneAttention(nn.Module):
-    """Co-Plane Attention: attention across MRI planes.
+    """Co-Plane Attention across MRI planes (slice-level).
 
-    For multi-sequence input, we treat each sequence as a 'plane' for attention.
-    Main sequence attends to other sequences.
+    Given a main sequence and two co-plane sequences (all as per-slice features),
+    performs cross-attention where main queries attend to co-plane keys/values,
+    then pools the attended slices into a global vector.
+
+    Args:
+        embed_dim: feature channel dimension C
+        num_heads: number of attention heads (default 4)
     """
 
-    def __init__(self, embed_dim):
+    def __init__(self, embed_dim, num_heads=4):
         super().__init__()
         self.embed_dim = embed_dim
+        self.num_heads = num_heads
+        self.head_dim = embed_dim // num_heads
+        assert self.head_dim * num_heads == embed_dim
 
-        # Q, K, V for main sequence
-        self.mq = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.mk = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.mv = nn.Linear(embed_dim, embed_dim, bias=False)
+        # Q from main, K/V from co-plane
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
 
-        # Q, K, V for co sequences (average over other sequences)
-        self.co_mq = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.co_mk = nn.Linear(embed_dim, embed_dim, bias=False)
-        self.co_mv = nn.Linear(embed_dim, embed_dim, bias=False)
-
+        self.out_proj = nn.Linear(embed_dim, embed_dim)
         self.norm = nn.LayerNorm(embed_dim)
+        self.scale = math.sqrt(self.head_dim)
 
-        ini_weights([self.mq, self.mk, self.mv, self.co_mq, self.co_mk, self.co_mv])
+        self.apply(_init_weights)
 
-    def forward(self, main_f, co_f):
-        """Forward pass.
-
+    def forward(self, main_f, co_f1, co_f2):
+        """
         Args:
-            main_f: [B, embed_dim] - main sequence features
-            co_f: [B, embed_dim] - co-sequence features (e.g., from other MRI planes)
+            main_f: [B, D_m, C] - main sequence per-slice features
+            co_f1:  [B, D_1, C] - co-plane sequence 1 per-slice features
+            co_f2:  [B, D_2, C] - co-plane sequence 2 per-slice features
 
         Returns:
-            fused: [B, embed_dim]
+            out: [B, C] - globally pooled attended feature
         """
-        B = main_f.shape[0]
+        B, D_m, C = main_f.shape
 
-        # Expand for batch processing
-        res = main_f
+        # Concatenate co-plane KV along slice dim
+        co_f = torch.cat([co_f1, co_f2], dim=1)  # [B, D_1+D_2, C]
+        D_co = co_f.size(1)
 
-        # Q from main
-        q = self.mq(main_f)  # [B, embed_dim]
-        q = q.unsqueeze(1)  # [B, 1, embed_dim]
+        # Project Q, K, V
+        q = self.q_proj(main_f)   # [B, D_m, C]
+        k = self.k_proj(co_f)     # [B, D_co, C]
+        v = self.v_proj(co_f)     # [B, D_co, C]
 
-        # K, V from co
-        k = self.co_mk(co_f).unsqueeze(1)  # [B, 1, embed_dim]
-        v = self.co_mv(co_f).unsqueeze(1)  # [B, 1, embed_dim]
+        # Multi-head reshape: [B, num_heads, D, head_dim]
+        q = q.view(B, D_m, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = k.view(B, D_co, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = v.view(B, D_co, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
 
-        # Attention
-        att = torch.matmul(q, k.transpose(1, 2)) / np.sqrt(self.embed_dim)
-        att = F.softmax(att, dim=-1)
+        # Attention: [B, num_heads, D_m, D_co]
+        attn = torch.matmul(q, k.transpose(-2, -1)) / self.scale
+        attn = F.softmax(attn, dim=-1)
 
-        out = torch.matmul(att, v)  # [B, 1, embed_dim]
-        out = out.squeeze(1)  # [B, embed_dim]
+        # Weighted sum: [B, num_heads, D_m, head_dim]
+        attended = torch.matmul(attn, v)
+
+        # Merge heads: [B, D_m, C]
+        attended = attended.permute(0, 2, 1, 3).contiguous().view(B, D_m, C)
+        attended = self.out_proj(attended)
 
         # Residual + norm
-        f = self.norm(0.5 * out + res)
+        fused = self.norm(attended + main_f)  # [B, D_m, C]
 
-        return f
+        # Pool over slices -> [B, C]
+        out = fused.mean(dim=1)
+        return out
 
 
 class CrossModalAttention(nn.Module):
-    """Cross-Modal Attention: combine features from different modalities."""
+    """Cross-Modal Attention: fuse PD feature with auxiliary modality (T1/T2).
 
-    def __init__(self, feature_channel):
+    Takes two globally pooled vectors and produces a fused vector using
+    learned attention weights.
+
+    Args:
+        feature_dim: channel dimension C
+    """
+
+    def __init__(self, feature_dim):
         super().__init__()
-        self.feature_channel = feature_channel
+        self.feature_dim = feature_dim
 
-        # Transform matrix: concatenate then project
-        self.transform_matrix = nn.Linear(2 * feature_channel, feature_channel)
-        self.norm = nn.BatchNorm1d(feature_channel)
+        self.gate = nn.Sequential(
+            nn.Linear(2 * feature_dim, feature_dim),
+            nn.BatchNorm1d(feature_dim),
+            nn.Sigmoid()
+        )
 
-        ini_weights([self.transform_matrix, self.norm])
+        self.apply(_init_weights)
 
     def forward(self, pdw_f, aux_f):
-        """Forward pass.
-
+        """
         Args:
-            pdw_f: [B, feature_channel] - primary sequence features
-            aux_f: [B, feature_channel] - auxiliary sequence features (e.g., T1/T2)
+            pdw_f: [B, C] - PD-weighted sequence feature (globally pooled)
+            aux_f: [B, C] - auxiliary modality feature (T1/T2, globally pooled)
 
         Returns:
-            fused: [B, feature_channel]
+            fused: [B, C]
         """
-        # Add
-        add_f = pdw_f + aux_f
+        cat_f = torch.cat([pdw_f, aux_f], dim=1)  # [B, 2C]
+        g = self.gate(cat_f)                        # [B, C], values in (0, 1)
 
-        # Concatenate
-        cat_f = torch.cat([pdw_f, aux_f], dim=1)  # [B, 2*feature_channel]
-
-        # Transform
-        att_f = self.transform_matrix(cat_f)
-        att_f = self.norm(att_f)
-        att_f = F.relu(att_f)
-
-        # Softmax weights
-        att_f = F.softmax(att_f, dim=-1)
-
-        # Weighted sum
-        f = add_f * att_f
-
-        return f
-
-
-class MultiSeqFusion(nn.Module):
-    """Multi-sequence fusion using CoPAS-style attention."""
-
-    def __init__(
-        self,
-        num_sequences,
-        feature_dim,
-        use_co_att=True,
-        use_cross_modal=True,
-        dropout=0.3
-    ):
-        super().__init__()
-
-        self.num_sequences = num_sequences
-        self.use_co_att = use_co_att
-        self.use_cross_modal = use_cross_modal
-
-        # Co-plane attention for each sequence
-        if use_co_att:
-            self.co_attentions = nn.ModuleList([
-                CoPlaneAttention(feature_dim)
-                for _ in range(num_sequences)
-            ])
-
-        # Cross-modal attention (between sequences)
-        if use_cross_modal:
-            self.cross_attentions = nn.ModuleList([
-                CrossModalAttention(feature_dim)
-                for _ in range(num_sequences)
-            ])
-
-        # Fusion FC
-        self.fusion_fc = nn.Sequential(
-            nn.Linear(feature_dim, feature_dim // 2),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, features):
-        """Fusion.
-
-        Args:
-            features: [B, num_seq, feature_dim]
-
-        Returns:
-            fused: [B, feature_dim // 2]
-        """
-        B, num_seq, feature_dim = features.shape
-
-        if num_seq == 1:
-            # Single sequence no fusion needed
-            fused = features.squeeze(1)
-        elif self.use_co_att and num_seq > 1:
-            # Use first sequence as main, average of rest as co
-            main_f = features[:, 0]  # [B, feature_dim]
-            co_f = features[:, 1:].mean(dim=1)  # [B, feature_dim]
-
-            fused = self.co_attentions[0](main_f, co_f)
-        else:
-            # Simple average (fallback)
-            fused = features.mean(dim=1)
-
-        # Final FC
-        fused = self.fusion_fc(fused)
-
+        # Gated fusion: blend PD and auxiliary
+        fused = g * pdw_f + (1 - g) * aux_f         # [B, C]
         return fused
-
-
-class SimpleFusion(nn.Module):
-    """Simple concatenation + FC fusion (fallback)."""
-
-    def __init__(self, num_sequences, feature_dim, hidden_dim=256, dropout=0.3):
-        super().__init__()
-
-        self.fc = nn.Sequential(
-            nn.Linear(feature_dim * num_sequences, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout)
-        )
-
-    def forward(self, features):
-        """Concatenate then FC.
-
-        Args:
-            features: [B, num_seq, feature_dim]
-
-        Returns:
-            fused: [B, hidden_dim]
-        """
-        B, num_seq, feature_dim = features.shape
-        fused = features.view(B, -1)  # [B, num_seq * feature_dim]
-        fused = self.fc(fused)
-        return fused
-
-
-# Aliases for backward compatibility
-CoPASFusion = MultiSeqFusion
-AttentionFusion = SimpleFusion
-ConcatenateFusion = SimpleFusion

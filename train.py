@@ -1,5 +1,6 @@
 """
 Main training script for shoulder MRI 3D classification.
+Adapted for ShoulderCoPASModel with 3 PD branches + final head.
 """
 import os
 import json
@@ -16,18 +17,16 @@ from data.label_mapper import LabelMapper
 from data.shoulder_dataset import ShoulderDataset3D
 from data.json_parser import JSONParser
 from models import create_model
-from utils.losses import MaskedBCEWithLogitsLoss, MaskedCrossEntropyLoss
+from utils.losses import MaskedBCEWithLogitsLoss
 from utils.metrics import compute_per_disease_metrics
 
 
 def load_config(config_path):
-    """Load YAML config."""
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
 
 
 def build_exam_list(config):
-    """Build list of valid exam IDs."""
     data_root = config['data']['data_root']
     json_root = config['data']['json_root']
 
@@ -40,7 +39,6 @@ def build_exam_list(config):
         for seq in config['data']['sequences']:
             path = os.path.join(data_root, eid, "%s.nii.gz" % seq)
             if not os.path.exists(path):
-                print("DEBUG: Missing image: %s" % path)
                 complete = False
                 break
 
@@ -57,14 +55,48 @@ def build_exam_list(config):
     return valid_exams
 
 
-def train_epoch(model, loader, optimizer, criterion, device, mode="train"):
+def compute_total_loss(output, labels, mask, criterion, branch_alpha):
+    """Compute multi-branch loss.
+
+    Loss = alpha * (sag_loss + cor_loss + axi_loss) + final_loss
+
+    Args:
+        output: dict from ShoulderCoPASModel.forward()
+        labels: [B, num_diseases]
+        mask:   [B, num_diseases]
+        criterion: MaskedBCEWithLogitsLoss
+        branch_alpha: weight for branch losses
+
+    Returns:
+        total_loss, loss_dict
+    """
+    final_loss = criterion(output['final_logits'], labels, mask)
+    sag_loss = criterion(output['sag_logits'], labels, mask)
+    cor_loss = criterion(output['cor_logits'], labels, mask)
+    axi_loss = criterion(output['axi_logits'], labels, mask)
+
+    branch_loss = sag_loss + cor_loss + axi_loss
+    total_loss = branch_alpha * branch_loss + final_loss
+
+    loss_dict = {
+        'total': total_loss.item(),
+        'final': final_loss.item(),
+        'sag': sag_loss.item(),
+        'cor': cor_loss.item(),
+        'axi': axi_loss.item(),
+    }
+    return total_loss, loss_dict
+
+
+def train_epoch(model, loader, optimizer, criterion, device, branch_alpha, mode="train"):
     """Train or validate for one epoch."""
     model.train() if mode == "train" else model.eval()
 
-    total_loss = 0
+    total_losses = {'total': 0, 'final': 0, 'sag': 0, 'cor': 0, 'axi': 0}
     all_preds = []
     all_labels = []
     all_masks = []
+    num_batches = 0
 
     try:
         from tqdm import tqdm
@@ -72,46 +104,43 @@ def train_epoch(model, loader, optimizer, criterion, device, mode="train"):
     except ImportError:
         iter_ = lambda x: x
 
-    for batch in iter_(loader):
-        images = batch["image"].to(device)
-        labels = batch["labels"].to(device)
-        mask = batch["mask"].to(device)
+    ctx = torch.no_grad() if mode != "train" else torch.enable_grad()
+    with ctx:
+        for batch in iter_(loader):
+            images = batch["image"].to(device)
+            labels = batch["labels"].to(device)
+            mask = batch["mask"].to(device)
 
-        if mode == "train":
-            optimizer.zero_grad()
+            if mode == "train":
+                optimizer.zero_grad()
 
-        logits = model(images)
+            output = model(images)
 
-        if logits.dim() == 3:
-            loss = criterion(logits.view(-1, 3), labels.view(-1), mask.view(-1))
-        else:
-            loss = criterion(logits, labels, mask)
+            loss, loss_dict = compute_total_loss(
+                output, labels, mask, criterion, branch_alpha)
 
-        if mode == "train":
-            loss.backward()
-            optimizer.step()
+            if mode == "train":
+                loss.backward()
+                optimizer.step()
 
-        total_loss += loss.item()
+            for k in total_losses:
+                total_losses[k] += loss_dict[k]
+            num_batches += 1
 
-        if logits.dim() == 3:
-            preds = logits.argmax(dim=2)
-        else:
-            preds = (torch.sigmoid(logits) > 0.5).long()
-
-        all_preds.append(preds.cpu().numpy())
-        all_labels.append(labels.cpu().numpy())
-        all_masks.append(mask.cpu().numpy())
+            preds = (torch.sigmoid(output['final_logits']) > 0.5).long()
+            all_preds.append(preds.cpu().numpy())
+            all_labels.append(labels.cpu().numpy())
+            all_masks.append(mask.cpu().numpy())
 
     all_preds = np.concatenate(all_preds, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
     all_masks = np.concatenate(all_masks, axis=0)
 
-    metrics = compute_per_disease_metrics(
-        all_labels, all_preds, DISEASES, binary=(logits.dim() != 3)
-    )
+    metrics = compute_per_disease_metrics(all_labels, all_preds, DISEASES, binary=True)
 
-    avg_loss = total_loss / len(loader)
-    metrics["loss"] = avg_loss
+    for k in total_losses:
+        metrics['loss_' + k] = total_losses[k] / max(num_batches, 1)
+    metrics['loss'] = metrics['loss_total']
 
     return metrics
 
@@ -132,29 +161,24 @@ def train(config, output_dir):
     raw_labels_lookup = {}
     if os.path.exists(metadata_path):
         print("Loading raw_labels from metadata...")
-        # Handle UTF-8 BOM
         with open(metadata_path, 'r', encoding='utf-8-sig') as f:
             reader = csv.DictReader(f)
             for row in reader:
                 eid = row['exam_id']
-                # Use label_ field (exists in CSV)
                 raw_labels = {}
                 for d in DISEASES:
                     raw_labels[d] = int(row['label_' + d])
                 raw_labels_lookup[eid] = raw_labels
         print("Loaded %d raw_labels" % len(raw_labels_lookup))
 
-    label_mapper = LabelMapper(
-        mode="binary" if config['training']['num_classes'] == 2 else "ternary"
-    )
+    label_mapper = LabelMapper(mode="binary")
 
-    # Create split using raw_labels_lookup
+    # Create split
     if raw_labels_lookup:
         from data.label_mapper import create_train_val_split as split_func
-        task_mode = "binary" if config['training']['num_classes'] == 2 else "ternary"
-        train_ids, val_ids = split_func(exam_ids, raw_labels_lookup, task_mode=task_mode, val_ratio=0.2)
+        train_ids, val_ids = split_func(exam_ids, raw_labels_lookup,
+                                         task_mode="binary", val_ratio=0.2)
     else:
-        # Fallback: random split
         np.random.seed(42)
         np.random.shuffle(exam_ids)
         n_val = int(len(exam_ids) * 0.2)
@@ -162,7 +186,6 @@ def train(config, output_dir):
 
     print("Train: %d, Val: %d" % (len(train_ids), len(val_ids)))
 
-    # Create datasets
     crop_size = tuple(config['model']['crop_size'])
 
     train_dataset = ShoulderDataset3D(
@@ -204,26 +227,21 @@ def train(config, output_dir):
     )
 
     # Create model
+    branch_alpha = config['training'].get('branch_alpha', 0.3)
     model = create_model(
         encoder=config['model']['encoder'],
-        num_classes=config['training']['num_classes'],
         num_diseases=len(config['data']['diseases']),
         pretrained=config['model']['pretrained'],
-        hidden_dim=256,
-        dropout=0.3,
-        fusion=config['model'].get('fusion', 'copas')
+        dropout=config['training'].get('dropout', 0.3),
+        num_heads=config['model'].get('num_heads', 4),
+        branch_alpha=branch_alpha,
     )
     model = model.to(device)
 
-    # Count parameters
     n_params = sum(p.numel() for p in model.parameters())
     print("Model parameters: %d" % n_params)
 
-    # Loss
-    if config['training']['loss'] == 'bce':
-        criterion = MaskedBCEWithLogitsLoss()
-    else:
-        criterion = MaskedCrossEntropyLoss()
+    criterion = MaskedBCEWithLogitsLoss()
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -241,17 +259,24 @@ def train(config, output_dir):
     epochs = config['training']['max_epochs']
 
     for epoch in range(epochs):
-        # Print progress
         print("[Epoch %d/%d] lr=%.6f" % (epoch + 1, epochs, optimizer.param_groups[0]['lr']))
 
-        train_metrics = train_epoch(model, train_loader, optimizer, criterion, device, "train")
+        train_metrics = train_epoch(
+            model, train_loader, optimizer, criterion, device, branch_alpha, "train")
 
         if (epoch + 1) % config['validation']['val_interval'] == 0:
-            val_metrics = train_epoch(model, val_loader, optimizer, criterion, device, "val")
+            val_metrics = train_epoch(
+                model, val_loader, optimizer, criterion, device, branch_alpha, "val")
 
             print("Epoch %d/%d" % (epoch + 1, epochs))
-            print("  Train Loss: %.4f" % train_metrics['loss'])
-            print("  Val Loss: %.4f" % val_metrics['loss'])
+            print("  Train Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f)" % (
+                train_metrics['loss'], train_metrics['loss_final'],
+                train_metrics['loss_sag'], train_metrics['loss_cor'],
+                train_metrics['loss_axi']))
+            print("  Val   Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f)" % (
+                val_metrics['loss'], val_metrics['loss_final'],
+                val_metrics['loss_sag'], val_metrics['loss_cor'],
+                val_metrics['loss_axi']))
 
             print("  Per-disease F1:")
             for disease in DISEASES:
@@ -259,6 +284,8 @@ def train(config, output_dir):
                 print("    %s: %.4f" % (disease, f1))
 
             avg_f1 = np.mean([val_metrics[d].get('f1', 0) for d in DISEASES])
+            print("  Avg F1: %.4f (best: %.4f)" % (avg_f1, best_f1))
+
             if avg_f1 > best_f1:
                 best_f1 = avg_f1
                 save_path = os.path.join(output_dir, "best_model.pt")
@@ -267,6 +294,7 @@ def train(config, output_dir):
                     'model_state_dict': model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'metrics': val_metrics,
+                    'branch_alpha': branch_alpha,
                 }, save_path)
                 print("  Saved best model: %s" % save_path)
                 patience_counter = 0
@@ -280,7 +308,7 @@ def train(config, output_dir):
 
         scheduler.step()
 
-    print("Training complete!")
+    print("Training complete! Best avg F1: %.4f" % best_f1)
     return model
 
 

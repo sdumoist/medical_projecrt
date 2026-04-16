@@ -378,16 +378,6 @@ Please note:
 
 ---
 
-## License
-
-Please add your preferred license, such as:
-
-* MIT
-* Apache-2.0
-* CC BY-NC 4.0
-
----
-
 ## Contact
 
 For questions, issues, or collaboration, please open a GitHub issue or contact the repository maintainer.
