@@ -191,6 +191,8 @@ project/
 │   ├── vis.py
 │   └── seed.py
 ├── scripts/
+│   ├── build_cls_cache.py
+│   └── build_loc_cache.py
 ├── train.py
 ├── infer.py
 └── outputs/
@@ -236,6 +238,13 @@ project/
 * token 导出
 * 可视化
 * 随机种子
+
+#### `scripts/`
+
+负责：
+
+* 分类缓存构建 (build_cls_cache.py)
+* 定位缓存构建 (build_loc_cache.py)
 
 #### `outputs/`
 

@@ -47,6 +47,8 @@ project/
 ├── models/
 ├── utils/
 ├── scripts/
+│   ├── build_cls_cache.py
+│   └── build_loc_cache.py
 ├── train.py
 ├── infer.py
 └── outputs/

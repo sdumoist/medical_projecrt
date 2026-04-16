@@ -194,6 +194,8 @@ project/
 │   ├── vis.py
 │   └── seed.py
 ├── scripts/
+│   ├── build_cls_cache.py
+│   └── build_loc_cache.py
 ├── train.py
 ├── infer.py
 └── outputs/
@@ -239,6 +241,13 @@ Responsible for:
 * token export
 * visualization
 * random seed utilities
+
+#### `scripts/`
+
+Responsible for:
+
+* classification cache building (build_cls_cache.py)
+* localizer cache building (build_loc_cache.py)
 
 #### `outputs/`
 
