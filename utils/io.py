@@ -64,9 +64,47 @@ def check_case_complete(exam_id):
 
 
 def load_nifti(path):
-    """Load NIfTI file and return data and affine."""
+    """Load NIfTI file and return raw data and affine.
+
+    NOTE: The returned array keeps the on-disk axis order (typically
+    H, W, Z for shoulder MRI).  Call ``normalize_axes`` to convert
+    to the project-standard [Z, H, W] layout.
+    """
     img = nib.load(path)
     return img.get_fdata(), img.affine
+
+
+def normalize_axes(volume):
+    """Convert NIfTI volume from on-disk (H, W, Z) to project-standard (Z, H, W).
+
+    Shoulder MRI NIfTI files are stored as (H, W, Z) where:
+        axis 0 = H  (rows,    ~320-768)
+        axis 1 = W  (columns, ~320-768)
+        axis 2 = Z  (slices,  ~18-24)
+
+    This function transposes to (Z, H, W) so that:
+        axis 0 = Z  (slices)
+        axis 1 = H  (rows)
+        axis 2 = W  (columns)
+
+    Works for both images (float) and masks (int).
+    Handles 4-D volumes by squeezing trailing dimensions first.
+    """
+    vol = np.squeeze(volume)
+    if vol.ndim != 3:
+        raise ValueError(
+            "Expected 3D volume after squeeze, got shape %s" % (vol.shape,))
+    # Transpose (H, W, Z) -> (Z, H, W)
+    return np.transpose(vol, (2, 0, 1))
+
+
+def load_nifti_normalized(path):
+    """Load NIfTI and immediately normalize to [Z, H, W].
+
+    Returns (volume_zhw, affine).
+    """
+    data, affine = load_nifti(path)
+    return normalize_axes(data), affine
 
 
 def save_nifti(data, affine, path):
@@ -95,7 +133,11 @@ def load_mask(exam_id, dataset_id):
 
 
 def get_key_slice(mask_data, axis=0):
-    """Extract key slice (slice with most foreground) from mask."""
+    """Extract key slice (slice with most foreground) from mask.
+
+    Expects input in [Z, H, W] layout. Default axis=0 means
+    searching along the Z (slice) dimension.
+    """
     if mask_data is None:
         return None
 
@@ -111,7 +153,11 @@ def get_key_slice(mask_data, axis=0):
 
 
 def get_bbox(mask_data, margin=5):
-    """Get bounding box from mask with margin."""
+    """Get bounding box from mask with margin.
+
+    Expects input in [Z, H, W] layout.
+    Returns (z_min, h_min, w_min, z_max, h_max, w_max).
+    """
     if mask_data is None:
         return None
 

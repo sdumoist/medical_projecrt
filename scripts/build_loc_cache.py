@@ -5,14 +5,16 @@ build_loc_cache.py
 ------------------
 Build localizer cache (.pt) with **image-mask aligned spatial transforms**.
 For each disease, the mask shares the SAME spatial transform as its anchor
-sequence image.  Serves G1-L / G2-L, key-slice, ROI, and lesion-token
-workflows.
+sequence image.
+
+Axis convention: all outputs are [Z, H, W].
+NIfTI on-disk order (H, W, Z) is transposed via utils.io.normalize_axes.
 
 Usage:
     python scripts/build_loc_cache.py \
         --metadata_csv outputs/metadata/metadata_master.csv \
         --output_dir   outputs/cache_loc \
-        --target_shape 32 96 96
+        --target_shape 20 448 448
 """
 from __future__ import print_function
 
@@ -26,6 +28,7 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
+from scipy.ndimage import zoom as ndizoom
 from tqdm import tqdm
 
 # ---- project imports -----------------------------------------------------
@@ -33,10 +36,10 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from utils.io import load_nifti
+from utils.io import load_nifti, normalize_axes
 from utils.seed import set_seed
 
-# ---- constants (hardcoded, no external implicit order) -------------------
+# ---- constants -----------------------------------------------------------
 SEQUENCE_ORDER = [
     "axial_PD",
     "coronal_PD",
@@ -57,7 +60,7 @@ DISEASE_ANCHOR_SEQ = {
     "GHOA": "coronal_PD",
 }
 
-PREPROCESS_VERSION = "v1"
+PREPROCESS_VERSION = "v2"
 
 logger = logging.getLogger("build_loc_cache")
 
@@ -72,13 +75,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split",        type=str, default="all")
     p.add_argument("--limit",        type=int, default=None)
     p.add_argument("--overwrite",    action="store_true")
-    p.add_argument("--target_shape", type=int, nargs=3, default=[32, 96, 96])
+    p.add_argument("--target_shape", type=int, nargs=3, default=[20, 448, 448],
+                   help="Z H W target shape")
     p.add_argument("--clip_percentile_low",  type=float, default=1.0)
     p.add_argument("--clip_percentile_high", type=float, default=99.0)
     p.add_argument("--normalize_mode", type=str, default="zscore",
                    choices=["zscore", "minmax", "robust_zscore"])
-    p.add_argument("--diseases", type=str, nargs="+", default=None,
-                   help="Subset of diseases (default: all 7)")
+    p.add_argument("--diseases", type=str, nargs="+", default=None)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -116,7 +119,6 @@ def filter_metadata_for_loc_cache(
         & (df["exclude_from_main_training"] == 0)
         & (df["quality_flag"].isin(allow_quality))
     )
-    # require at least one mask
     if "has_any_mask" in df.columns:
         mask = mask & (df["has_any_mask"] == 1)
     if split != "all":
@@ -153,15 +155,17 @@ def get_mask_paths_from_row(
 
 
 # =========================================================================
-# 4. Image / mask loading
+# 4. Image / mask loading  (with axis normalization)
 # =========================================================================
 
 def load_case_images(seq_paths: Dict[str, str]) -> Dict[str, np.ndarray]:
+    """Load five sequences and normalize to [Z, H, W]."""
     images = {}
     for seq, path in seq_paths.items():
         if not os.path.exists(path):
             raise FileNotFoundError("Missing sequence %s: %s" % (seq, path))
         data, _ = load_nifti(path)
+        data = normalize_axes(data)  # (H,W,Z) -> (Z,H,W)
         images[seq] = data.astype(np.float32)
     return images
 
@@ -169,80 +173,60 @@ def load_case_images(seq_paths: Dict[str, str]) -> Dict[str, np.ndarray]:
 def load_case_masks(
     mask_paths: Dict[str, Optional[str]]
 ) -> Dict[str, Optional[np.ndarray]]:
+    """Load masks and normalize to [Z, H, W]."""
     masks: Dict[str, Optional[np.ndarray]] = {}
     for disease, path in mask_paths.items():
         if path is None or not os.path.exists(path):
             masks[disease] = None
         else:
             data, _ = load_nifti(path)
+            data = normalize_axes(data)  # (H,W,Z) -> (Z,H,W)
             masks[disease] = data.astype(np.int16)
     return masks
 
 
 # =========================================================================
-# 5. Deterministic spatial transform
+# 5. Spatial transforms  (Z pad/crop + H/W resize)
 # =========================================================================
 
-def compute_spatial_transform_params_from_volume(
-    volume: np.ndarray,
-    target_shape: tuple,
-) -> Dict:
-    """Compute centre-crop parameters from a single reference volume.
-    These parameters must be shared by image AND mask for alignment.
-    """
-    D, H, W = volume.shape
-    TD, TH, TW = target_shape
-    return {
-        "crop_start": [
-            max(0, (D - TD) // 2),
-            max(0, (H - TH) // 2),
-            max(0, (W - TW) // 2),
-        ],
-        "crop_size": [min(D, TD), min(H, TH), min(W, TW)],
-        "target_shape": list(target_shape),
-    }
+def pad_or_crop_z(volume: np.ndarray, target_z: int) -> np.ndarray:
+    Z = volume.shape[0]
+    if Z == target_z:
+        return volume
+    elif Z > target_z:
+        start = (Z - target_z) // 2
+        return volume[start: start + target_z]
+    else:
+        out = np.zeros((target_z,) + volume.shape[1:], dtype=volume.dtype)
+        start = (target_z - Z) // 2
+        out[start: start + Z] = volume
+        return out
 
 
-def _apply_transform(
-    vol: np.ndarray,
-    params: Dict,
-    pad_value: float = 0.0,
-) -> np.ndarray:
-    """Apply crop + pad using externally-provided params (no recomputation)."""
-    d0, h0, w0 = params["crop_start"]
-    cd, ch, cw = params["crop_size"]
-    TD, TH, TW = params["target_shape"]
-
-    cropped = vol[d0: d0 + cd, h0: h0 + ch, w0: w0 + cw]
-
-    if cropped.shape == (TD, TH, TW):
-        return cropped
-
-    out = np.full((TD, TH, TW), pad_value, dtype=vol.dtype)
-    pd_ = (TD - cropped.shape[0]) // 2
-    ph_ = (TH - cropped.shape[1]) // 2
-    pw_ = (TW - cropped.shape[2]) // 2
-    out[pd_: pd_ + cropped.shape[0],
-        ph_: ph_ + cropped.shape[1],
-        pw_: pw_ + cropped.shape[2]] = cropped
-    return out
+def resize_hw(volume: np.ndarray, target_h: int, target_w: int,
+              order: int = 1) -> np.ndarray:
+    """order=1 for images (linear), order=0 for masks (nearest)."""
+    Z, H, W = volume.shape
+    if H == target_h and W == target_w:
+        return volume
+    zoom_factors = (1.0, target_h / H, target_w / W)
+    return ndizoom(volume, zoom_factors, order=order).astype(volume.dtype)
 
 
-def apply_spatial_transform_to_image(
-    volume: np.ndarray, transform_params: Dict
-) -> np.ndarray:
-    return _apply_transform(volume, transform_params, pad_value=0.0)
-
-
-def apply_spatial_transform_to_mask(
-    mask: np.ndarray, transform_params: Dict
-) -> np.ndarray:
-    """Mask uses the SAME params as its anchor image. Pad with 0 (background)."""
-    return _apply_transform(mask, transform_params, pad_value=0)
+def compute_z_crop_params(z_orig: int, target_z: int) -> Dict:
+    """Record the Z crop/pad for reproducibility."""
+    if z_orig >= target_z:
+        start = (z_orig - target_z) // 2
+        return {"z_orig": z_orig, "z_start": start, "z_len": target_z,
+                "z_pad_before": 0, "target_z": target_z}
+    else:
+        pad_before = (target_z - z_orig) // 2
+        return {"z_orig": z_orig, "z_start": 0, "z_len": z_orig,
+                "z_pad_before": pad_before, "target_z": target_z}
 
 
 # =========================================================================
-# 6. Intensity preprocessing (image only, NOT mask)
+# 6. Intensity preprocessing (image only)
 # =========================================================================
 
 def clip_intensity(
@@ -290,34 +274,25 @@ def preprocess_case_for_localizer(
     normalize_mode: str,
 ) -> Tuple[np.ndarray, Dict, Dict]:
     """
-    Layer 1: Build global 5-sequence image tensor [5, D, H, W].
-             Each sequence independently centre-cropped to target_shape.
-    Layer 2: For each disease, compute anchor-space transform from the
-             RAW anchor image, then apply that SAME transform to both
-             the anchor image and the disease mask.
+    All inputs must already be in [Z, H, W] via normalize_axes.
 
-    Returns:
-        image_tensor:  np.ndarray [5, D, H, W]
-        processed_masks: {disease: np.ndarray [D,H,W] or None}
-        spatial_meta: {
-            "global_image": {...},
-            "per_disease": {disease: {...}, ...}
-        }
+    Layer 1: Build global 5-sequence image tensor [5, TZ, TH, TW].
+    Layer 2: For each disease, apply the SAME Z-crop and H/W-resize
+             derived from the anchor image to its mask.
     """
+    TZ, TH, TW = target_shape
+
     # ---- Layer 1: global image tensor ------------------------------------
     processed_images = []
-    global_per_seq_params = {}
     for seq in sequence_order:
-        raw_vol = image_dict[seq]
-        vol = clip_intensity(raw_vol, clip_percentile_low, clip_percentile_high)
-        seq_params = compute_spatial_transform_params_from_volume(
-            vol, target_shape)
-        vol = apply_spatial_transform_to_image(vol, seq_params)
+        vol = image_dict[seq]              # [Z, H, W]
+        vol = clip_intensity(vol, clip_percentile_low, clip_percentile_high)
+        vol = pad_or_crop_z(vol, TZ)
+        vol = resize_hw(vol, TH, TW, order=1)
         vol = normalize_volume(vol, normalize_mode)
         processed_images.append(vol)
-        global_per_seq_params[seq] = seq_params
 
-    image_tensor = np.stack(processed_images, axis=0)  # [5, D, H, W]
+    image_tensor = np.stack(processed_images, axis=0)  # [5, TZ, TH, TW]
 
     # ---- Layer 2: per-disease anchor-space mask alignment ----------------
     processed_masks: Dict[str, Optional[np.ndarray]] = {}
@@ -325,27 +300,34 @@ def preprocess_case_for_localizer(
 
     for disease in diseases:
         anchor_seq = DISEASE_ANCHOR_SEQ[disease]
-        raw_anchor = image_dict[anchor_seq]  # original raw volume
+        raw_anchor = image_dict[anchor_seq]  # [Z, H, W] already normalized axes
+        anchor_z = raw_anchor.shape[0]
+        anchor_h = raw_anchor.shape[1]
+        anchor_w = raw_anchor.shape[2]
 
-        # compute transform from RAW anchor (before clip/norm)
-        anchor_params = compute_spatial_transform_params_from_volume(
-            raw_anchor, target_shape)
+        z_params = compute_z_crop_params(anchor_z, TZ)
         per_disease_meta[disease] = {
             "anchor_seq": anchor_seq,
-            "transform_params": anchor_params,
+            "anchor_shape_zhw": [anchor_z, anchor_h, anchor_w],
+            "z_params": z_params,
+            "resize_hw": [TH, TW],
         }
 
         m = mask_dict.get(disease)
         if m is None:
             processed_masks[disease] = None
         else:
-            # apply the SAME anchor_params to the mask
-            processed_masks[disease] = apply_spatial_transform_to_mask(
-                m, anchor_params)
+            # Apply SAME transforms as anchor image:
+            # 1) Z pad/crop using anchor's Z-crop params
+            m = pad_or_crop_z(m, TZ)
+            # 2) H/W resize with nearest-neighbor (order=0)
+            m = resize_hw(m, TH, TW, order=0)
+            processed_masks[disease] = m
 
     spatial_meta = {
         "global_image": {
             "target_shape": list(target_shape),
+            "axis_order": "Z_H_W",
             "preprocess_version": PREPROCESS_VERSION,
         },
         "per_disease": per_disease_meta,
@@ -354,35 +336,37 @@ def preprocess_case_for_localizer(
 
 
 # =========================================================================
-# 8. Key-slice & bbox extraction (from aligned masks)
+# 8. Key-slice & bbox extraction (from aligned [Z,H,W] masks)
 # =========================================================================
 
 def extract_key_slice_from_mask(mask: np.ndarray) -> int:
+    """Key slice = Z index with most foreground pixels."""
     if mask is None:
         return -1
     fg = (mask > 0)
     if not fg.any():
         return -1
-    sums = fg.sum(axis=(1, 2))
+    sums = fg.sum(axis=(1, 2))  # sum over H, W per Z-slice
     return int(np.argmax(sums))
 
 
 def extract_bbox_from_mask(
     mask: np.ndarray, margin: int = 2
 ) -> Optional[List[int]]:
+    """Returns [z1, z2, h1, h2, w1, w2] in [Z,H,W] space."""
     if mask is None:
         return None
     fg = np.where(mask > 0)
     if len(fg[0]) == 0:
         return None
-    D, H, W = mask.shape
+    Z, H, W = mask.shape
     z1 = max(0, int(fg[0].min()) - margin)
-    z2 = min(D - 1, int(fg[0].max()) + margin)
-    y1 = max(0, int(fg[1].min()) - margin)
-    y2 = min(H - 1, int(fg[1].max()) + margin)
-    x1 = max(0, int(fg[2].min()) - margin)
-    x2 = min(W - 1, int(fg[2].max()) + margin)
-    return [z1, z2, y1, y2, x1, x2]
+    z2 = min(Z - 1, int(fg[0].max()) + margin)
+    h1 = max(0, int(fg[1].min()) - margin)
+    h2 = min(H - 1, int(fg[1].max()) + margin)
+    w1 = max(0, int(fg[2].min()) - margin)
+    w2 = min(W - 1, int(fg[2].max()) + margin)
+    return [z1, z2, h1, h2, w1, w2]
 
 
 def extract_localizer_targets(
@@ -448,10 +432,7 @@ def build_loc_cache_index_row(
     processed_masks: Dict[str, Optional[np.ndarray]],
     diseases: List[str],
 ) -> Dict:
-    row: Dict = {
-        "exam_id": exam_id,
-        "cache_path": cache_path,
-    }
+    row: Dict = {"exam_id": exam_id, "cache_path": cache_path}
     available = 0
     for d in diseases:
         m = processed_masks.get(d)
@@ -466,21 +447,16 @@ def build_loc_cache_index_row(
 
 
 def append_failed_case(
-    failed_log_path: str,
-    exam_id: str,
-    error_type: str,
-    error_message: str,
+    failed_log_path: str, exam_id: str,
+    error_type: str, error_message: str,
 ) -> None:
     write_header = not os.path.exists(failed_log_path)
     with open(failed_log_path, "a") as f:
         w = csv.DictWriter(f, fieldnames=["exam_id", "error_type", "error_message"])
         if write_header:
             w.writeheader()
-        w.writerow({
-            "exam_id": exam_id,
-            "error_type": error_type,
-            "error_message": error_message,
-        })
+        w.writerow({"exam_id": exam_id, "error_type": error_type,
+                     "error_message": error_message})
 
 
 # =========================================================================
@@ -493,7 +469,7 @@ def build_loc_cache(
     split: str = "all",
     limit: Optional[int] = None,
     overwrite: bool = False,
-    target_shape: tuple = (32, 96, 96),
+    target_shape: tuple = (20, 448, 448),
     clip_percentile_low: float = 1.0,
     clip_percentile_high: float = 99.0,
     normalize_mode: str = "zscore",
@@ -529,22 +505,18 @@ def build_loc_cache(
             continue
 
         try:
-            # load raw data
             seq_paths = get_sequence_paths_from_row(row)
             images = load_case_images(seq_paths)
             mask_paths = get_mask_paths_from_row(row, diseases)
             masks = load_case_masks(mask_paths)
 
-            # preprocess with anchor-space alignment
             img_tensor, proc_masks, spatial_meta = preprocess_case_for_localizer(
                 images, masks, SEQUENCE_ORDER, diseases, target_shape,
                 clip_percentile_low, clip_percentile_high, normalize_mode,
             )
 
-            # extract key-slices / bbox from ALIGNED masks
             key_slices, roi_boxes = extract_localizer_targets(proc_masks)
 
-            # save
             record = build_loc_cache_record(
                 exam_id, img_tensor, proc_masks,
                 key_slices, roi_boxes, SEQUENCE_ORDER, spatial_meta,
@@ -582,12 +554,11 @@ def main():
 
     diseases = args.diseases if args.diseases else list(DISEASES)
 
-    logger.info("=== build_loc_cache ===")
+    logger.info("=== build_loc_cache (v2: Z_H_W + resize) ===")
     logger.info("metadata_csv : %s", args.metadata_csv)
     logger.info("output_dir   : %s", args.output_dir)
-    logger.info("target_shape : %s", args.target_shape)
+    logger.info("target_shape : %s  (Z, H, W)", args.target_shape)
     logger.info("diseases     : %s", diseases)
-    logger.info("sequence_order: %s", SEQUENCE_ORDER)
 
     build_loc_cache(
         metadata_csv=args.metadata_csv,

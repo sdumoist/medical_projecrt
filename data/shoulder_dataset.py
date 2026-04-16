@@ -10,7 +10,7 @@ from scipy import ndimage
 
 from data.json_parser import JSONParser
 from data.label_mapper import LabelMapper
-from utils.io import SEQUENCE_TYPES, load_nifti, get_image_path
+from utils.io import SEQUENCE_TYPES, load_nifti, normalize_axes, get_image_path
 
 
 class ShoulderDataset3D(Dataset):
@@ -61,27 +61,27 @@ class ShoulderDataset3D(Dataset):
         return len(self.valid_indices)
 
     def _load_sequence(self, exam_id, sequence):
-        """Load a single sequence."""
+        """Load a single sequence and normalize to [Z, H, W]."""
         img_path = os.path.join(self.data_root, exam_id, "%s.nii.gz" % sequence)
         data, affine = load_nifti(img_path)
+        data = normalize_axes(data)  # (H,W,Z) -> (Z,H,W)
         return data
 
     def _resample_crop(self, data):
-        """Resample and crop 3D volume."""
-        # Squeeze extra dimensions (e.g. 4D NIfTI with trailing dim)
+        """Centre crop/pad 3D volume in [Z, H, W] layout."""
         data = np.squeeze(data)
         if data.ndim != 3:
             raise ValueError("Expected 3D volume after squeeze, got shape %s" % (data.shape,))
-        d, h, w = data.shape
-        td, th, tw = self.crop_size
+        z, h, w = data.shape
+        tz, th, tw = self.crop_size
 
-        # Simple center crop (can be improved with actual resampling)
-        d_start = max(0, (d - td) // 2)
+        # Simple center crop
+        z_start = max(0, (z - tz) // 2)
         h_start = max(0, (h - th) // 2)
         w_start = max(0, (w - tw) // 2)
 
         data = data[
-            d_start:d_start + td,
+            z_start:z_start + tz,
             h_start:h_start + th,
             w_start:w_start + tw
         ]
@@ -89,11 +89,11 @@ class ShoulderDataset3D(Dataset):
         # Pad if needed
         if data.shape != self.crop_size:
             padded = np.zeros(self.crop_size, dtype=data.dtype)
-            cd, ch, cw = data.shape
-            pd_start = (td - cd) // 2
+            cz, ch, cw = data.shape
+            pz_start = (tz - cz) // 2
             ph_start = (th - ch) // 2
             pw_start = (tw - cw) // 2
-            padded[pd_start:pd_start + cd, ph_start:ph_start + ch, pw_start:pw_start + cw] = data
+            padded[pz_start:pz_start + cz, ph_start:ph_start + ch, pw_start:pw_start + cw] = data
             data = padded
 
         return data
@@ -113,7 +113,7 @@ class ShoulderDataset3D(Dataset):
         real_idx = self.valid_indices[idx]
         exam_id = self.exam_ids[real_idx]
 
-        # Load all sequences [5, D, H, W]
+        # Load all sequences [5, Z, H, W]
         images = []
         for seq in self.sequences:
             data = self._load_sequence(exam_id, seq)
@@ -137,13 +137,13 @@ class ShoulderDataset3D(Dataset):
         labels = torch.from_numpy(labels)
         mask = torch.from_numpy(mask)
 
-        # Model expects [B, num_seq, C, D, H, W] after DataLoader
-        # Dataset returns [num_seq, 1, D, H, W], DataLoader adds batch dim
-        images = images[:, None]  # [5, 1, D, H, W]
+        # Model expects [B, num_seq, C, Z, H, W] after DataLoader
+        # Dataset returns [num_seq, 1, Z, H, W], DataLoader adds batch dim
+        images = images[:, None]  # [5, 1, Z, H, W]
 
         return {
             "exam_id": exam_id,
-            "image": images,  # [5, 1, D, H, W] -> DataLoader makes [B, 5, 1, D, H, W]
+            "image": images,  # [5, 1, Z, H, W] -> DataLoader makes [B, 5, 1, Z, H, W]
             "labels": labels,  # [7]
             "mask": mask,  # [7]
         }

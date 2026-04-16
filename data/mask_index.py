@@ -9,7 +9,7 @@ import argparse
 
 from utils.io import (
     NNUNET_ROOT, DISEASES, DISEASE_ANCHOR_SEQ,
-    load_nifti, get_key_slice, get_bbox
+    load_nifti, normalize_axes, get_key_slice, get_bbox
 )
 
 
@@ -37,12 +37,13 @@ def find_mask_path(exam_id, dataset_id):
 
 
 def extract_key_slice(mask_path, axis=0):
-    """Extract key slice from mask."""
+    """Extract key slice from mask. Input normalized to [Z,H,W], axis=0 is Z."""
     if not mask_path or not os.path.exists(mask_path):
         return None
 
     try:
         data, _ = load_nifti(mask_path)
+        data = normalize_axes(data)  # (H,W,Z) -> (Z,H,W)
         if data is None:
             return None
         return get_key_slice(data, axis)
@@ -51,12 +52,13 @@ def extract_key_slice(mask_path, axis=0):
 
 
 def extract_bbox(mask_path):
-    """Extract bounding box from mask."""
+    """Extract bounding box from mask. Returns (z_min,h_min,w_min,z_max,h_max,w_max)."""
     if not mask_path or not os.path.exists(mask_path):
         return None
 
     try:
         data, _ = load_nifti(mask_path)
+        data = normalize_axes(data)  # (H,W,Z) -> (Z,H,W)
         if data is None:
             return None
         return get_bbox(data)
@@ -96,6 +98,7 @@ def generate_mask_index_csv(exam_ids, output_path="outputs/metadata/mask_index.c
             if mask_path and os.path.exists(mask_path):
                 try:
                     data, _ = load_nifti(mask_path)
+                    data = normalize_axes(data)  # (H,W,Z) -> (Z,H,W)
                     key_slice = get_key_slice(data, axis=0)
                     row["key_slice_%s" % disease] = key_slice if key_slice is not None else ""
 

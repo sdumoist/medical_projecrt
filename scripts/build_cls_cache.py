@@ -6,11 +6,14 @@ build_cls_cache.py
 Build deterministic classification-only cache (.pt) from five-sequence
 shoulder MRI NIfTI files.  Serves G1 / G2 binary / ternary training.
 
+Axis convention: all outputs are [Z, H, W]  (slices, rows, cols).
+NIfTI on-disk order (H, W, Z) is transposed via utils.io.normalize_axes.
+
 Usage:
     python scripts/build_cls_cache.py \
         --metadata_csv outputs/metadata/metadata_master.csv \
         --output_dir   outputs/cache_cls \
-        --target_shape 32 96 96
+        --target_shape 20 448 448
 """
 from __future__ import print_function
 
@@ -24,17 +27,18 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
+from scipy.ndimage import zoom as ndizoom
 from tqdm import tqdm
 
-# ---- project imports (add project root to path) -------------------------
+# ---- project imports -----------------------------------------------------
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from utils.io import load_nifti
+from utils.io import load_nifti, normalize_axes
 from utils.seed import set_seed
 
-# ---- constants (hardcoded, do NOT depend on external implicit order) -----
+# ---- constants -----------------------------------------------------------
 SEQUENCE_ORDER = [
     "axial_PD",
     "coronal_PD",
@@ -43,7 +47,7 @@ SEQUENCE_ORDER = [
     "sagittal_T1WI",
 ]
 
-PREPROCESS_VERSION = "v1"
+PREPROCESS_VERSION = "v2"  # v2: normalize_axes + resize H/W
 
 logger = logging.getLogger("build_cls_cache")
 
@@ -61,8 +65,8 @@ def parse_args() -> argparse.Namespace:
                    help="Max cases to process (debug)")
     p.add_argument("--overwrite",    action="store_true")
     p.add_argument("--target_shape", type=int, nargs=3,
-                   default=[32, 96, 96],
-                   help="D H W for centre-crop / pad")
+                   default=[20, 448, 448],
+                   help="Z H W target shape")
     p.add_argument("--clip_percentile_low",  type=float, default=1.0)
     p.add_argument("--clip_percentile_high", type=float, default=99.0)
     p.add_argument("--normalize_mode", type=str, default="zscore",
@@ -121,64 +125,52 @@ def get_sequence_paths_from_row(row: pd.Series) -> Dict[str, str]:
 
 
 # =========================================================================
-# 4. Image loading
+# 4. Image loading  (with axis normalization)
 # =========================================================================
 
 def load_case_images(seq_paths: Dict[str, str]) -> Dict[str, np.ndarray]:
+    """Load five sequences and normalize to [Z, H, W]."""
     images = {}
     for seq, path in seq_paths.items():
         if not os.path.exists(path):
             raise FileNotFoundError("Missing sequence %s: %s" % (seq, path))
         data, _ = load_nifti(path)
+        data = normalize_axes(data)  # (H,W,Z) -> (Z,H,W)
         images[seq] = data.astype(np.float32)
     return images
 
 
 # =========================================================================
-# 5. Spatial transform
+# 5. Spatial transform:  Z pad/crop  +  H/W resize
 # =========================================================================
 
-def compute_center_crop_params(
-    shape: tuple, target_shape: tuple
-) -> Dict[str, int]:
-    D, H, W = shape
-    TD, TH, TW = target_shape
-    d_start = max(0, (D - TD) // 2)
-    h_start = max(0, (H - TH) // 2)
-    w_start = max(0, (W - TW) // 2)
-    return dict(
-        d_start=d_start, h_start=h_start, w_start=w_start,
-        td=TD, th=TH, tw=TW,
-    )
+def pad_or_crop_z(volume: np.ndarray, target_z: int) -> np.ndarray:
+    """Centre pad/crop along Z (axis 0) only."""
+    Z = volume.shape[0]
+    if Z == target_z:
+        return volume
+    elif Z > target_z:
+        start = (Z - target_z) // 2
+        return volume[start: start + target_z]
+    else:
+        out = np.zeros((target_z,) + volume.shape[1:], dtype=volume.dtype)
+        start = (target_z - Z) // 2
+        out[start: start + Z] = volume
+        return out
 
 
-def apply_crop_or_pad(
-    volume: np.ndarray,
-    crop_params: Dict[str, int],
-    target_shape: tuple,
-) -> np.ndarray:
-    D, H, W = volume.shape
-    TD, TH, TW = target_shape
-    ds = crop_params["d_start"]
-    hs = crop_params["h_start"]
-    ws = crop_params["w_start"]
+def resize_hw(volume: np.ndarray, target_h: int, target_w: int,
+              order: int = 1) -> np.ndarray:
+    """Resize H and W dimensions using scipy zoom.
 
-    cropped = volume[
-        ds: ds + min(D, TD),
-        hs: hs + min(H, TH),
-        ws: ws + min(W, TW),
-    ]
-
-    cd, ch, cw = cropped.shape
-    if cd == TD and ch == TH and cw == TW:
-        return cropped
-
-    out = np.zeros((TD, TH, TW), dtype=volume.dtype)
-    pd_ = (TD - cd) // 2
-    ph_ = (TH - ch) // 2
-    pw_ = (TW - cw) // 2
-    out[pd_: pd_ + cd, ph_: ph_ + ch, pw_: pw_ + cw] = cropped
-    return out
+    Args:
+        order: interpolation order. 1=linear (for images), 0=nearest (for masks).
+    """
+    Z, H, W = volume.shape
+    if H == target_h and W == target_w:
+        return volume
+    zoom_factors = (1.0, target_h / H, target_w / W)
+    return ndizoom(volume, zoom_factors, order=order).astype(volume.dtype)
 
 
 # =========================================================================
@@ -186,9 +178,7 @@ def apply_crop_or_pad(
 # =========================================================================
 
 def clip_intensity(
-    volume: np.ndarray,
-    low_pct: float = 1.0,
-    high_pct: float = 99.0,
+    volume: np.ndarray, low_pct: float = 1.0, high_pct: float = 99.0
 ) -> np.ndarray:
     lo = np.percentile(volume, low_pct)
     hi = np.percentile(volume, high_pct)
@@ -229,19 +219,22 @@ def preprocess_case_images(
     clip_percentile_high: float,
     normalize_mode: str,
 ) -> Tuple[np.ndarray, Dict]:
+    """Preprocess five [Z,H,W] sequences -> stack to [5, TZ, TH, TW]."""
+    TZ, TH, TW = target_shape
     volumes = []
     for seq in sequence_order:
-        vol = image_dict[seq]
+        vol = image_dict[seq]              # [Z, H, W]
         vol = clip_intensity(vol, clip_percentile_low, clip_percentile_high)
-        crop_p = compute_center_crop_params(vol.shape, target_shape)
-        vol = apply_crop_or_pad(vol, crop_p, target_shape)
+        vol = pad_or_crop_z(vol, TZ)       # Z -> TZ
+        vol = resize_hw(vol, TH, TW, order=1)  # H,W -> TH,TW
         vol = normalize_volume(vol, normalize_mode)
         volumes.append(vol)
 
-    image_tensor = np.stack(volumes, axis=0)  # [5, D, H, W]
+    image_tensor = np.stack(volumes, axis=0)  # [5, TZ, TH, TW]
 
     spatial_meta = {
         "target_shape": list(target_shape),
+        "axis_order": "Z_H_W",
         "preprocess_version": PREPROCESS_VERSION,
     }
     return image_tensor, spatial_meta
@@ -259,29 +252,25 @@ def build_cache_record(
 ) -> Dict:
     return {
         "exam_id": exam_id,
-        "image": torch.from_numpy(image_tensor).float(),  # [5,D,H,W]
+        "image": torch.from_numpy(image_tensor).float(),
         "sequence_order": list(sequence_order),
         "spatial_meta": spatial_meta,
     }
 
 
 def verify_cls_cache_record(record: Dict, target_shape: tuple) -> None:
-    """Minimal sanity check after building a cache record."""
     img = record["image"]
-    TD, TH, TW = target_shape
-    assert img.shape == (5, TD, TH, TW), \
-        "image shape %s != expected (5, %d, %d, %d)" % (img.shape, TD, TH, TW)
+    TZ, TH, TW = target_shape
+    assert img.shape == (5, TZ, TH, TW), \
+        "image shape %s != expected (5, %d, %d, %d)" % (img.shape, TZ, TH, TW)
     assert img.dtype == torch.float32, \
         "image dtype %s != float32" % img.dtype
     seq = record["sequence_order"]
-    assert len(seq) == 5, "sequence_order length %d != 5" % len(seq)
-    assert seq == SEQUENCE_ORDER, \
+    assert len(seq) == 5 and seq == SEQUENCE_ORDER, \
         "sequence_order mismatch: %s" % seq
 
 
-def save_cls_cache_record(
-    record: Dict, save_path: str,
-) -> None:
+def save_cls_cache_record(record: Dict, save_path: str) -> None:
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
     torch.save(record, save_path)
 
@@ -294,19 +283,18 @@ def build_cache_index_row(
     exam_id: str,
     cache_path: str,
     target_shape: tuple,
-    cache_format: str,
     success: int = 1,
 ) -> Dict:
     return {
         "exam_id": exam_id,
         "cache_path": cache_path,
         "cache_exists": int(os.path.exists(cache_path)) if cache_path else 0,
-        "shape_D": target_shape[0],
+        "shape_Z": target_shape[0],
         "shape_H": target_shape[1],
         "shape_W": target_shape[2],
         "sequence_order": ";".join(SEQUENCE_ORDER),
         "target_shape": "%d,%d,%d" % target_shape,
-        "cache_format": cache_format,
+        "cache_format": "pt",
         "preprocess_version": PREPROCESS_VERSION,
         "success": success,
     }
@@ -340,12 +328,11 @@ def build_cls_cache(
     split: str = "all",
     limit: Optional[int] = None,
     overwrite: bool = False,
-    target_shape: tuple = (32, 96, 96),
+    target_shape: tuple = (20, 448, 448),
     clip_percentile_low: float = 1.0,
     clip_percentile_high: float = 99.0,
     normalize_mode: str = "zscore",
 ) -> None:
-    cache_format = "pt"
     os.makedirs(output_dir, exist_ok=True)
     index_path = os.path.join(output_dir, "cache_cls_index.csv")
     failed_path = os.path.join(output_dir, "failed_cases.csv")
@@ -365,7 +352,7 @@ def build_cls_cache(
 
         if not overwrite and os.path.exists(save_path):
             index_rows.append(build_cache_index_row(
-                exam_id, save_path, target_shape, cache_format, success=1))
+                exam_id, save_path, target_shape, success=1))
             success_count += 1
             continue
 
@@ -380,7 +367,7 @@ def build_cls_cache(
             verify_cls_cache_record(record, target_shape)
             save_cls_cache_record(record, save_path)
             index_rows.append(build_cache_index_row(
-                exam_id, save_path, target_shape, cache_format, success=1))
+                exam_id, save_path, target_shape, success=1))
             success_count += 1
 
         except Exception as e:
@@ -390,7 +377,7 @@ def build_cls_cache(
             logger.warning("[FAIL] %s : %s: %s", exam_id, err_type, err_msg)
             append_failed_case(failed_path, exam_id, err_type, err_msg)
             index_rows.append(build_cache_index_row(
-                exam_id, "", target_shape, cache_format, success=0))
+                exam_id, "", target_shape, success=0))
 
     pd.DataFrame(index_rows).to_csv(index_path, index=False)
     logger.info("Done. success=%d  fail=%d  index -> %s",
@@ -409,13 +396,12 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
-    logger.info("=== build_cls_cache ===")
+    logger.info("=== build_cls_cache (v2: Z_H_W + resize) ===")
     logger.info("metadata_csv : %s", args.metadata_csv)
     logger.info("output_dir   : %s", args.output_dir)
-    logger.info("target_shape : %s", args.target_shape)
+    logger.info("target_shape : %s  (Z, H, W)", args.target_shape)
     logger.info("normalize    : %s", args.normalize_mode)
     logger.info("split        : %s", args.split)
-    logger.info("sequence_order: %s", SEQUENCE_ORDER)
 
     build_cls_cache(
         metadata_csv=args.metadata_csv,
