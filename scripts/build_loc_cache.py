@@ -3,8 +3,10 @@
 """
 build_loc_cache.py
 ------------------
-Build localizer cache (.pt) with image-mask aligned spatial transforms.
-Serves G1-L / G2-L, key-slice, ROI, and lesion-token workflows.
+Build localizer cache (.pt) with **image-mask aligned spatial transforms**.
+For each disease, the mask shares the SAME spatial transform as its anchor
+sequence image.  Serves G1-L / G2-L, key-slice, ROI, and lesion-token
+workflows.
 
 Usage:
     python scripts/build_loc_cache.py \
@@ -24,7 +26,6 @@ from typing import Dict, List, Tuple, Optional
 import numpy as np
 import pandas as pd
 import torch
-from scipy.ndimage import zoom as ndizoom
 from tqdm import tqdm
 
 # ---- project imports -----------------------------------------------------
@@ -32,11 +33,31 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from utils.io import load_nifti, SEQUENCE_TYPES, DISEASES
+from utils.io import load_nifti
 from utils.seed import set_seed
 
-# ---- constants -----------------------------------------------------------
-SEQUENCE_ORDER: List[str] = list(SEQUENCE_TYPES)
+# ---- constants (hardcoded, no external implicit order) -------------------
+SEQUENCE_ORDER = [
+    "axial_PD",
+    "coronal_PD",
+    "coronal_T2WI",
+    "sagittal_PD",
+    "sagittal_T1WI",
+]
+
+DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
+
+DISEASE_ANCHOR_SEQ = {
+    "SST":  "coronal_PD",
+    "IST":  "axial_PD",
+    "SSC":  "axial_PD",
+    "LHBT": "coronal_PD",
+    "IGHL": "coronal_PD",
+    "RIPI": "sagittal_PD",
+    "GHOA": "coronal_PD",
+}
+
+PREPROCESS_VERSION = "v1"
 
 logger = logging.getLogger("build_loc_cache")
 
@@ -56,12 +77,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--clip_percentile_high", type=float, default=99.0)
     p.add_argument("--normalize_mode", type=str, default="zscore",
                    choices=["zscore", "minmax", "robust_zscore"])
-    p.add_argument("--require_mask", action="store_true", default=True,
-                   help="Only include cases with at least one mask")
     p.add_argument("--diseases", type=str, nargs="+", default=None,
                    help="Subset of diseases (default: all 7)")
-    p.add_argument("--extract_key_slice", action="store_true", default=True)
-    p.add_argument("--extract_bbox",      action="store_true", default=True)
     p.add_argument("--seed", type=int, default=42)
     return p.parse_args()
 
@@ -92,7 +109,6 @@ def filter_metadata_for_loc_cache(
     split: str = "all",
     limit: Optional[int] = None,
     allow_quality: tuple = ("high", "medium"),
-    require_mask: bool = True,
 ) -> pd.DataFrame:
     mask = (
         (df["has_all_images"] == 1)
@@ -100,7 +116,8 @@ def filter_metadata_for_loc_cache(
         & (df["exclude_from_main_training"] == 0)
         & (df["quality_flag"].isin(allow_quality))
     )
-    if require_mask and "has_any_mask" in df.columns:
+    # require at least one mask
+    if "has_any_mask" in df.columns:
         mask = mask & (df["has_any_mask"] == 1)
     if split != "all":
         mask = mask & (df["split"] == split)
@@ -163,69 +180,65 @@ def load_case_masks(
 
 
 # =========================================================================
-# 5. Unified spatial transform (image & mask share the same params)
+# 5. Deterministic spatial transform
 # =========================================================================
 
-def compute_spatial_transform_params(
-    reference_volume: np.ndarray,
+def compute_spatial_transform_params_from_volume(
+    volume: np.ndarray,
     target_shape: tuple,
 ) -> Dict:
-    """Compute crop-start, crop-size, and zoom factors."""
-    D, H, W = reference_volume.shape
+    """Compute centre-crop parameters from a single reference volume.
+    These parameters must be shared by image AND mask for alignment.
+    """
+    D, H, W = volume.shape
     TD, TH, TW = target_shape
-
-    # centre-crop extents (capped to actual size)
-    cd = min(D, TD)
-    ch = min(H, TH)
-    cw = min(W, TW)
-
-    d0 = max(0, (D - TD) // 2)
-    h0 = max(0, (H - TH) // 2)
-    w0 = max(0, (W - TW) // 2)
-
     return {
-        "crop_start": [d0, h0, w0],
-        "crop_size": [cd, ch, cw],
+        "crop_start": [
+            max(0, (D - TD) // 2),
+            max(0, (H - TH) // 2),
+            max(0, (W - TW) // 2),
+        ],
+        "crop_size": [min(D, TD), min(H, TH), min(W, TW)],
         "target_shape": list(target_shape),
     }
 
 
-def _crop_volume(vol: np.ndarray, params: Dict) -> np.ndarray:
+def _apply_transform(
+    vol: np.ndarray,
+    params: Dict,
+    pad_value: float = 0.0,
+) -> np.ndarray:
+    """Apply crop + pad using externally-provided params (no recomputation)."""
     d0, h0, w0 = params["crop_start"]
     cd, ch, cw = params["crop_size"]
-    return vol[d0: d0 + cd, h0: h0 + ch, w0: w0 + cw]
+    TD, TH, TW = params["target_shape"]
 
+    cropped = vol[d0: d0 + cd, h0: h0 + ch, w0: w0 + cw]
 
-def _pad_to_target(vol: np.ndarray, target_shape: tuple,
-                   pad_value: float = 0.0) -> np.ndarray:
-    TD, TH, TW = target_shape
-    cd, ch, cw = vol.shape
-    if cd == TD and ch == TH and cw == TW:
-        return vol
+    if cropped.shape == (TD, TH, TW):
+        return cropped
+
     out = np.full((TD, TH, TW), pad_value, dtype=vol.dtype)
-    pd = (TD - cd) // 2
-    ph = (TH - ch) // 2
-    pw = (TW - cw) // 2
-    out[pd: pd + cd, ph: ph + ch, pw: pw + cw] = vol
+    pd_ = (TD - cropped.shape[0]) // 2
+    ph_ = (TH - cropped.shape[1]) // 2
+    pw_ = (TW - cropped.shape[2]) // 2
+    out[pd_: pd_ + cropped.shape[0],
+        ph_: ph_ + cropped.shape[1],
+        pw_: pw_ + cropped.shape[2]] = cropped
     return out
 
 
 def apply_spatial_transform_to_image(
     volume: np.ndarray, transform_params: Dict
 ) -> np.ndarray:
-    target_shape = tuple(transform_params["target_shape"])
-    vol = _crop_volume(volume, transform_params)
-    vol = _pad_to_target(vol, target_shape, pad_value=0.0)
-    return vol
+    return _apply_transform(volume, transform_params, pad_value=0.0)
 
 
 def apply_spatial_transform_to_mask(
     mask: np.ndarray, transform_params: Dict
 ) -> np.ndarray:
-    target_shape = tuple(transform_params["target_shape"])
-    m = _crop_volume(mask, transform_params)
-    m = _pad_to_target(m, target_shape, pad_value=0)
-    return m
+    """Mask uses the SAME params as its anchor image. Pad with 0 (background)."""
+    return _apply_transform(mask, transform_params, pad_value=0)
 
 
 # =========================================================================
@@ -240,89 +253,108 @@ def clip_intensity(
     return np.clip(volume, lo, hi)
 
 
-def normalize_volume(
-    volume: np.ndarray, mode: str = "zscore"
-) -> np.ndarray:
+def normalize_volume(volume: np.ndarray, mode: str = "zscore") -> np.ndarray:
     v = volume.astype(np.float32)
     if mode == "zscore":
         mu, std = v.mean(), v.std()
-        return (v - mu) / max(std, 1e-8)
+        if std < 1e-8:
+            return v - mu
+        return (v - mu) / std
     elif mode == "minmax":
         vmin, vmax = v.min(), v.max()
-        return (v - vmin) / max(vmax - vmin, 1e-8)
+        if vmax - vmin < 1e-8:
+            return v - vmin
+        return (v - vmin) / (vmax - vmin)
     elif mode == "robust_zscore":
         med = np.median(v)
         mad = np.median(np.abs(v - med))
-        return (v - med) / max(mad * 1.4826, 1e-8)
+        if mad < 1e-8:
+            return v - med
+        return (v - med) / (mad * 1.4826)
     else:
         raise ValueError("Unknown normalize_mode: %s" % mode)
 
 
 # =========================================================================
-# 7. Case-level preprocessing
+# 7. Case-level preprocessing  (two layers)
 # =========================================================================
 
 def preprocess_case_for_localizer(
     image_dict: Dict[str, np.ndarray],
     mask_dict: Dict[str, Optional[np.ndarray]],
     sequence_order: List[str],
+    diseases: List[str],
     target_shape: tuple,
     clip_percentile_low: float,
     clip_percentile_high: float,
     normalize_mode: str,
-) -> Tuple[Dict, Dict, Dict]:
-    """Process images and masks with identical spatial transform.
-
-    The reference volume for computing crop params is the first available
-    sequence (axial_PD by default).
+) -> Tuple[np.ndarray, Dict, Dict]:
     """
-    # Use first sequence as spatial reference
-    ref_seq = sequence_order[0]
-    ref_vol = image_dict[ref_seq]
-    transform_params = compute_spatial_transform_params(ref_vol, target_shape)
+    Layer 1: Build global 5-sequence image tensor [5, D, H, W].
+             Each sequence independently centre-cropped to target_shape.
+    Layer 2: For each disease, compute anchor-space transform from the
+             RAW anchor image, then apply that SAME transform to both
+             the anchor image and the disease mask.
 
-    # ---- images ----------------------------------------------------------
-    processed_images: Dict[str, np.ndarray] = {}
+    Returns:
+        image_tensor:  np.ndarray [5, D, H, W]
+        processed_masks: {disease: np.ndarray [D,H,W] or None}
+        spatial_meta: {
+            "global_image": {...},
+            "per_disease": {disease: {...}, ...}
+        }
+    """
+    # ---- Layer 1: global image tensor ------------------------------------
+    processed_images = []
+    global_per_seq_params = {}
     for seq in sequence_order:
-        vol = image_dict[seq]
-        vol = clip_intensity(vol, clip_percentile_low, clip_percentile_high)
-        # Each sequence may have different shape, so compute per-seq params
-        seq_params = compute_spatial_transform_params(vol, target_shape)
+        raw_vol = image_dict[seq]
+        vol = clip_intensity(raw_vol, clip_percentile_low, clip_percentile_high)
+        seq_params = compute_spatial_transform_params_from_volume(
+            vol, target_shape)
         vol = apply_spatial_transform_to_image(vol, seq_params)
         vol = normalize_volume(vol, normalize_mode)
-        processed_images[seq] = vol
+        processed_images.append(vol)
+        global_per_seq_params[seq] = seq_params
 
-    # ---- masks (use same transform as *anchor* sequence, NOT image) ------
+    image_tensor = np.stack(processed_images, axis=0)  # [5, D, H, W]
+
+    # ---- Layer 2: per-disease anchor-space mask alignment ----------------
     processed_masks: Dict[str, Optional[np.ndarray]] = {}
-    for disease, m in mask_dict.items():
+    per_disease_meta: Dict[str, Dict] = {}
+
+    for disease in diseases:
+        anchor_seq = DISEASE_ANCHOR_SEQ[disease]
+        raw_anchor = image_dict[anchor_seq]  # original raw volume
+
+        # compute transform from RAW anchor (before clip/norm)
+        anchor_params = compute_spatial_transform_params_from_volume(
+            raw_anchor, target_shape)
+        per_disease_meta[disease] = {
+            "anchor_seq": anchor_seq,
+            "transform_params": anchor_params,
+        }
+
+        m = mask_dict.get(disease)
         if m is None:
             processed_masks[disease] = None
         else:
-            m_params = compute_spatial_transform_params(m, target_shape)
-            processed_masks[disease] = apply_spatial_transform_to_mask(m, m_params)
+            # apply the SAME anchor_params to the mask
+            processed_masks[disease] = apply_spatial_transform_to_mask(
+                m, anchor_params)
 
     spatial_meta = {
-        "crop_start": transform_params["crop_start"],
-        "crop_size": transform_params["crop_size"],
-        "target_shape": list(target_shape),
-        "preprocess_version": "v1",
+        "global_image": {
+            "target_shape": list(target_shape),
+            "preprocess_version": PREPROCESS_VERSION,
+        },
+        "per_disease": per_disease_meta,
     }
-    return processed_images, processed_masks, spatial_meta
+    return image_tensor, processed_masks, spatial_meta
 
 
 # =========================================================================
-# 8. Stack images
-# =========================================================================
-
-def stack_images(
-    processed_images: Dict[str, np.ndarray],
-    sequence_order: List[str],
-) -> np.ndarray:
-    return np.stack([processed_images[s] for s in sequence_order], axis=0)
-
-
-# =========================================================================
-# 9. Key-slice & bbox extraction (from aligned masks)
+# 8. Key-slice & bbox extraction (from aligned masks)
 # =========================================================================
 
 def extract_key_slice_from_mask(mask: np.ndarray) -> int:
@@ -331,7 +363,7 @@ def extract_key_slice_from_mask(mask: np.ndarray) -> int:
     fg = (mask > 0)
     if not fg.any():
         return -1
-    sums = fg.sum(axis=(1, 2))  # per-slice foreground count
+    sums = fg.sum(axis=(1, 2))
     return int(np.argmax(sums))
 
 
@@ -369,7 +401,7 @@ def extract_localizer_targets(
 
 
 # =========================================================================
-# 10. Cache record
+# 9. Cache record
 # =========================================================================
 
 def build_loc_cache_record(
@@ -394,7 +426,7 @@ def build_loc_cache_record(
         "mask": mask_tensors,
         "key_slices": key_slices,
         "roi_boxes": roi_boxes,
-        "sequence_order": sequence_order,
+        "sequence_order": list(sequence_order),
         "spatial_meta": spatial_meta,
     }
 
@@ -405,7 +437,7 @@ def save_loc_cache_record(record: Dict, save_path: str) -> None:
 
 
 # =========================================================================
-# 11. Index & failure logging
+# 10. Index & failure logging
 # =========================================================================
 
 def build_loc_cache_index_row(
@@ -414,13 +446,15 @@ def build_loc_cache_index_row(
     key_slices: Dict[str, int],
     roi_boxes: Dict[str, Optional[List[int]]],
     processed_masks: Dict[str, Optional[np.ndarray]],
+    diseases: List[str],
 ) -> Dict:
     row: Dict = {
         "exam_id": exam_id,
         "cache_path": cache_path,
     }
     available = 0
-    for d, m in processed_masks.items():
+    for d in diseases:
+        m = processed_masks.get(d)
         has = int(m is not None and (m > 0).any())
         row["%s_mask_available" % d] = has
         row["%s_key_slice" % d] = key_slices.get(d, -1)
@@ -450,7 +484,7 @@ def append_failed_case(
 
 
 # =========================================================================
-# 12. Main driver
+# 11. Main driver
 # =========================================================================
 
 def build_loc_cache(
@@ -472,14 +506,11 @@ def build_loc_cache(
     index_path = os.path.join(output_dir, "cache_loc_index.csv")
     failed_path = os.path.join(output_dir, "failed_cases.csv")
 
-    # ---- metadata --------------------------------------------------------
     df = load_metadata(metadata_csv)
-    df = filter_metadata_for_loc_cache(df, split=split, limit=limit,
-                                        require_mask=True)
+    df = filter_metadata_for_loc_cache(df, split=split, limit=limit)
     total = len(df)
     logger.info("Cases to cache: %d  (split=%s)", total, split)
 
-    # ---- iterate ---------------------------------------------------------
     index_rows: List[Dict] = []
     success_count = 0
     fail_count = 0
@@ -489,31 +520,28 @@ def build_loc_cache(
         save_path = os.path.join(output_dir, "%s.pt" % exam_id)
 
         if not overwrite and os.path.exists(save_path):
-            # quick skip: add placeholder index row
             placeholder_masks = {d: None for d in diseases}
             placeholder_ks = {d: -1 for d in diseases}
             index_rows.append(build_loc_cache_index_row(
-                exam_id, save_path, placeholder_ks, {}, placeholder_masks))
+                exam_id, save_path, placeholder_ks, {},
+                placeholder_masks, diseases))
             success_count += 1
             continue
 
         try:
-            # load
+            # load raw data
             seq_paths = get_sequence_paths_from_row(row)
             images = load_case_images(seq_paths)
             mask_paths = get_mask_paths_from_row(row, diseases)
             masks = load_case_masks(mask_paths)
 
-            # preprocess (aligned)
-            proc_imgs, proc_masks, spatial_meta = preprocess_case_for_localizer(
-                images, masks, SEQUENCE_ORDER, target_shape,
+            # preprocess with anchor-space alignment
+            img_tensor, proc_masks, spatial_meta = preprocess_case_for_localizer(
+                images, masks, SEQUENCE_ORDER, diseases, target_shape,
                 clip_percentile_low, clip_percentile_high, normalize_mode,
             )
 
-            # stack images
-            img_tensor = stack_images(proc_imgs, SEQUENCE_ORDER)
-
-            # extract key-slices / bbox
+            # extract key-slices / bbox from ALIGNED masks
             key_slices, roi_boxes = extract_localizer_targets(proc_masks)
 
             # save
@@ -524,7 +552,8 @@ def build_loc_cache(
             save_loc_cache_record(record, save_path)
 
             index_rows.append(build_loc_cache_index_row(
-                exam_id, save_path, key_slices, roi_boxes, proc_masks))
+                exam_id, save_path, key_slices, roi_boxes,
+                proc_masks, diseases))
             success_count += 1
 
         except Exception as e:
@@ -534,14 +563,13 @@ def build_loc_cache(
             logger.warning("[FAIL] %s : %s: %s", exam_id, err_type, err_msg)
             append_failed_case(failed_path, exam_id, err_type, err_msg)
 
-    # ---- write index -----------------------------------------------------
     pd.DataFrame(index_rows).to_csv(index_path, index=False)
     logger.info("Done. success=%d  fail=%d  index -> %s",
                 success_count, fail_count, index_path)
 
 
 # =========================================================================
-# 13. CLI entry
+# 12. CLI entry
 # =========================================================================
 
 def main():
@@ -552,11 +580,14 @@ def main():
     args = parse_args()
     set_seed(args.seed)
 
+    diseases = args.diseases if args.diseases else list(DISEASES)
+
     logger.info("=== build_loc_cache ===")
     logger.info("metadata_csv : %s", args.metadata_csv)
     logger.info("output_dir   : %s", args.output_dir)
     logger.info("target_shape : %s", args.target_shape)
-    logger.info("diseases     : %s", args.diseases or "all")
+    logger.info("diseases     : %s", diseases)
+    logger.info("sequence_order: %s", SEQUENCE_ORDER)
 
     build_loc_cache(
         metadata_csv=args.metadata_csv,
@@ -568,7 +599,7 @@ def main():
         clip_percentile_low=args.clip_percentile_low,
         clip_percentile_high=args.clip_percentile_high,
         normalize_mode=args.normalize_mode,
-        diseases=args.diseases,
+        diseases=diseases,
     )
 
 
