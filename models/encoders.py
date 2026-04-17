@@ -236,6 +236,14 @@ def densenet3d_121(in_channels=1):
     return DenseNet3D(growth_rate=32, block_config=(6, 12, 24, 16),
                       num_init_features=64, in_channels=in_channels)
 
+def densenet3d_169(in_channels=1):
+    return DenseNet3D(growth_rate=32, block_config=(6, 12, 32, 32),
+                      num_init_features=64, in_channels=in_channels)
+
+def densenet3d_201(in_channels=1):
+    return DenseNet3D(growth_rate=32, block_config=(6, 12, 48, 32),
+                      num_init_features=64, in_channels=in_channels)
+
 def resnet3d_18(in_channels=1):
     return ResNet3D(BasicBlock3D, [2, 2, 2, 2], in_channels=in_channels)
 
@@ -252,7 +260,11 @@ def resnet3d_152(in_channels=1):
 def get_encoder(name, in_channels=1):
     """Get encoder by name. Returns an encoder with forward/forward_slice/forward_pool."""
     name = name.lower()
-    if "densenet121" in name or "densenet" in name:
+    if "densenet201" in name:
+        return densenet3d_201(in_channels)
+    elif "densenet169" in name:
+        return densenet3d_169(in_channels)
+    elif "densenet121" in name or "densenet" in name:
         return densenet3d_121(in_channels)
     elif "resnet152" in name:
         return resnet3d_152(in_channels)

@@ -14,8 +14,14 @@ Architecture:
     Final:
         FinalHead(cat(sag_feat, cor_feat, axi_feat)) -> final logits [B, 7]
 
+    Optional localizer (when use_localizer=True):
+        Each branch encoder produces per-slice features [B, D', C].
+        A lightweight SliceHead predicts key-slice logits [B, 7, D'] per disease.
+        Supervised by key_slices from nnUNet masks via cross-entropy.
+
 Loss:
     alpha * (sag_loss + cor_loss + axi_loss) + final_loss
+    + localizer_alpha * localizer_loss   (when enabled)
 
 Sequence index convention (matching config data.sequences order):
     0: axial_PD
@@ -43,6 +49,30 @@ SEQ_INDEX = {
 NUM_DISEASES = 7
 
 
+class SliceHead(nn.Module):
+    """Predict key-slice logits for each disease from per-slice features.
+
+    Input:  [B, D', C]  (per-slice features from one branch)
+    Output: [B, num_diseases, D']  (logits over slices per disease)
+    """
+
+    def __init__(self, feat_dim, num_diseases=7):
+        super().__init__()
+        self.fc = nn.Linear(feat_dim, num_diseases)
+
+    def forward(self, slice_features):
+        """
+        Args:
+            slice_features: [B, D', C]
+        Returns:
+            logits: [B, num_diseases, D']
+        """
+        # [B, D', C] -> [B, D', num_diseases]
+        logits = self.fc(slice_features)
+        # -> [B, num_diseases, D']
+        return logits.permute(0, 2, 1)
+
+
 class ShoulderCoPASModel(nn.Module):
     """CoPAS 3-branch model for shoulder MRI classification (binary).
 
@@ -53,6 +83,7 @@ class ShoulderCoPASModel(nn.Module):
         dropout: dropout rate
         num_heads: number of attention heads in CoPlaneAttention
         branch_alpha: weight for auxiliary branch losses
+        use_localizer: whether to enable key-slice prediction head
     """
 
     def __init__(
@@ -62,11 +93,13 @@ class ShoulderCoPASModel(nn.Module):
         pretrained=False,
         dropout=0.3,
         num_heads=4,
-        branch_alpha=0.3
+        branch_alpha=0.3,
+        use_localizer=False,
     ):
         super().__init__()
         self.num_diseases = num_diseases
         self.branch_alpha = branch_alpha
+        self.use_localizer = use_localizer
 
         # --- 5 independent encoders (one per sequence) ---
         self.encoders = nn.ModuleDict()
@@ -98,6 +131,12 @@ class ShoulderCoPASModel(nn.Module):
         self.final_head = FinalHead(feat_dim, num_branches=3,
                                      num_diseases=num_diseases, dropout=dropout)
 
+        # --- Localizer: key-slice prediction ---
+        if use_localizer:
+            # Use coronal_PD slice features as anchor for key-slice prediction
+            # (most diseases have coronal_PD as anchor sequence)
+            self.slice_head = SliceHead(feat_dim, num_diseases)
+
     def _encode_slice(self, x, seq_name):
         """Encode a single sequence to per-slice features [B, D', C]."""
         return self.encoders[seq_name].forward_slice(x)
@@ -106,10 +145,11 @@ class ShoulderCoPASModel(nn.Module):
         """Encode a single sequence to global feature [B, C]."""
         return self.encoders[seq_name].forward_pool(x)
 
-    def forward(self, x):
+    def forward(self, x, **kwargs):
         """
         Args:
             x: [B, 5, C, D, H, W] where dim=1 follows SEQ_INDEX order
+            **kwargs: optional localizer inputs (key_slices, localizer_mask)
 
         Returns:
             dict with keys:
@@ -120,6 +160,7 @@ class ShoulderCoPASModel(nn.Module):
                 'sag_feat':      [B, feat_dim]
                 'cor_feat':      [B, feat_dim]
                 'axi_feat':      [B, feat_dim]
+                'slice_logits':  [B, num_diseases, D']  (only when use_localizer)
         """
         # Extract individual sequences: x[:, i] -> [B, C, D, H, W]
         axi_pd = x[:, SEQ_INDEX['axial_PD']]
@@ -152,7 +193,7 @@ class ShoulderCoPASModel(nn.Module):
         axi_logits = self.axi_head(axi_feat)
         final_logits = self.final_head([sag_feat, cor_feat, axi_feat])
 
-        return {
+        result = {
             'final_logits': final_logits,
             'sag_logits': sag_logits,
             'cor_logits': cor_logits,
@@ -162,9 +203,19 @@ class ShoulderCoPASModel(nn.Module):
             'axi_feat': axi_feat,
         }
 
+        # === Localizer: key-slice prediction ===
+        if self.use_localizer:
+            # Use coronal_PD slice features as anchor
+            # cor_pd_slice: [B, D', C]
+            slice_logits = self.slice_head(cor_pd_slice)  # [B, 7, D']
+            result['slice_logits'] = slice_logits
+
+        return result
+
 
 def create_model(encoder="resnet3d_18", num_diseases=7, pretrained=False,
-                 dropout=0.3, num_heads=4, branch_alpha=0.3, **kwargs):
+                 dropout=0.3, num_heads=4, branch_alpha=0.3,
+                 use_localizer=False, **kwargs):
     """Create ShoulderCoPASModel from config."""
     return ShoulderCoPASModel(
         encoder_name=encoder,
@@ -173,4 +224,5 @@ def create_model(encoder="resnet3d_18", num_diseases=7, pretrained=False,
         dropout=dropout,
         num_heads=num_heads,
         branch_alpha=branch_alpha,
+        use_localizer=use_localizer,
     )

@@ -6,6 +6,11 @@ data:
   json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
   nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
 
+  # Cache settings
+  use_cache: true
+  cache_mode: cls
+  cache_root: outputs/cache_cls
+
   # Sequences to use
   sequences:
     - axial_PD
@@ -32,7 +37,7 @@ model:
 
   # Input settings
   input_spacing: [1.0, 1.0, 1.0]
-  crop_size: [96, 96, 64]  # Reduced for memory
+  crop_size: [96, 96, 64]  # Only used for raw nii fallback
 
   # Localizer settings (for _L models)
   use_localizer: false

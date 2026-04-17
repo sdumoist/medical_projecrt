@@ -3,13 +3,14 @@ Shoulder MRI Dataset.
 Loads 5-sequence MRI data with 3D volumes.
 
 Supports three data source modes:
-  - "cache_cls":  read pre-built .pt from build_cls_cache.py
-  - "cache_loc":  read pre-built .pt from build_loc_cache.py  (includes masks)
-  - "raw":        read raw .nii.gz files on-the-fly  (fallback / debug)
+  - "cls":   read pre-built .pt from build_cls_cache.py
+  - "loc":   read pre-built .pt from build_loc_cache.py  (includes masks)
+  - "none":  read raw .nii.gz files on-the-fly  (fallback / debug)
 
 All modes output images in [5, 1, Z, H, W] with project-standard Z-first axis.
 """
 import os
+import warnings
 import numpy as np
 import torch
 from torch.utils.data import Dataset
@@ -40,34 +41,67 @@ class ShoulderCacheDataset(Dataset):
 
     Works with both cache_cls and cache_loc formats.
     cache_cls record: {exam_id, image[5,Z,H,W], sequence_order, spatial_meta}
-    cache_loc record: {exam_id, image[5,Z,H,W], mask{...}, key_slices, ...}
+    cache_loc record: {exam_id, image[5,Z,H,W], mask{...}, key_slices, roi_boxes, ...}
     """
 
     def __init__(
         self,
-        cache_index_csv,
+        cache_root,
+        exam_ids=None,
         label_mapper=None,
         raw_labels_lookup=None,
-        mode="cache_cls",
+        cache_mode="cls",
+        project_root=None,
+        min_z=32,
     ):
         """
         Args:
-            cache_index_csv: path to cache_cls_index.csv or cache_loc_index.csv
+            cache_root: directory containing .pt files and index CSV
+            exam_ids: if provided, only use these exam IDs (for train/val split)
             label_mapper: LabelMapper instance
             raw_labels_lookup: {exam_id: {disease: raw_label, ...}}
-            mode: "cache_cls" or "cache_loc"
+            cache_mode: "cls" or "loc"
+            project_root: root dir to resolve relative cache_path; defaults to cwd
+            min_z: minimum Z dimension; pads with zeros if cache Z < min_z
+                   (DenseNet needs Z>=32 due to 5 pooling stages)
         """
-        import pandas as pd
-        df = pd.read_csv(cache_index_csv)
-        df = df[df["success"] == 1].reset_index(drop=True)
-
-        self.cache_paths = df["cache_path"].tolist()
-        self.exam_ids = df["exam_id"].tolist()
+        self.cache_mode = cache_mode
+        self.min_z = min_z
         self.label_mapper = label_mapper
         self.raw_labels_lookup = raw_labels_lookup or {}
-        self.mode = mode
+        self.project_root = project_root or os.getcwd()
 
-        print("ShoulderCacheDataset(%s): %d cases" % (mode, len(self.exam_ids)))
+        # Read index CSV
+        index_name = "cache_cls_index.csv" if cache_mode == "cls" else "cache_loc_index.csv"
+        index_path = os.path.join(cache_root, index_name)
+        if not os.path.exists(index_path):
+            raise FileNotFoundError("Cache index not found: %s" % index_path)
+
+        import csv
+        self.exam_ids = []
+        self.cache_paths = []
+        with open(index_path, 'r', encoding='utf-8-sig') as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                if int(row.get("success", 0)) != 1:
+                    continue
+                eid = row["exam_id"]
+                if exam_ids is not None and eid not in exam_ids:
+                    continue
+                # Resolve cache path (may be relative)
+                cp = row["cache_path"]
+                if not os.path.isabs(cp):
+                    cp = os.path.join(self.project_root, cp)
+                self.exam_ids.append(eid)
+                self.cache_paths.append(cp)
+
+        # Convert exam_ids filter to set for quick note
+        if exam_ids is not None:
+            requested = len(set(exam_ids))
+        else:
+            requested = "all"
+        print("ShoulderCacheDataset(cache_%s): %d cases (requested: %s)"
+              % (cache_mode, len(self.exam_ids), requested))
 
     def __len__(self):
         return len(self.exam_ids)
@@ -75,11 +109,19 @@ class ShoulderCacheDataset(Dataset):
     def __getitem__(self, idx):
         exam_id = self.exam_ids[idx]
         cache_path = self.cache_paths[idx]
-        record = torch.load(cache_path, map_location="cpu")
+        record = torch.load(cache_path, map_location="cpu", weights_only=False)
 
-        # image: [5, Z, H, W] -> [5, 1, Z, H, W]
+        # image: [5, Z, H, W] -> pad Z if needed -> [5, 1, Z', H, W]
         images = record["image"]  # FloatTensor [5, Z, H, W]
-        images = images.unsqueeze(1)  # [5, 1, Z, H, W]
+        Z = images.shape[1]
+        if Z < self.min_z:
+            pad_total = self.min_z - Z
+            pad_before = pad_total // 2
+            pad_after = pad_total - pad_before
+            # F.pad expects (last_dim_left, last_dim_right, ..., first_dim_left, first_dim_right)
+            # images is [5, Z, H, W], pad dim=1 (Z): need (0,0, 0,0, pad_before, pad_after)
+            images = torch.nn.functional.pad(images, (0, 0, 0, 0, pad_before, pad_after))
+        images = images.unsqueeze(1)  # [5, 1, Z', H, W]
 
         # labels
         labels = torch.zeros(7, dtype=torch.int64)
@@ -99,10 +141,43 @@ class ShoulderCacheDataset(Dataset):
         }
 
         # For cache_loc, also pass segmentation masks and localizer targets
-        if self.mode == "cache_loc" and "mask" in record:
-            out["seg_masks"] = record["mask"]       # {disease: tensor or None}
-            out["key_slices"] = record.get("key_slices", {})
-            out["roi_boxes"] = record.get("roi_boxes", {})
+        if self.cache_mode == "loc":
+            seg_masks = record.get("mask", {})
+            key_slices_raw = record.get("key_slices", {})
+            roi_boxes_raw = record.get("roi_boxes", {})
+
+            from data.label_mapper import DISEASES
+
+            # Z-padding offset for key_slices
+            orig_Z = record["image"].shape[1]
+            z_offset = (self.min_z - orig_Z) // 2 if orig_Z < self.min_z else 0
+
+            # key_slices: dict -> tensor [7], -1 for missing, shifted by z_offset
+            ks = torch.full((7,), -1, dtype=torch.long)
+            for i, d in enumerate(DISEASES):
+                v = key_slices_raw.get(d, -1)
+                if v is not None and v >= 0:
+                    ks[i] = v + z_offset
+            out["key_slices"] = ks
+
+            # roi_boxes: dict -> tensor [7, 6], zeros for missing
+            rb = torch.zeros(7, 6, dtype=torch.float32)
+            for i, d in enumerate(DISEASES):
+                box = roi_boxes_raw.get(d, None)
+                if box is not None and len(box) == 6:
+                    rb[i] = torch.tensor(box, dtype=torch.float32)
+            out["roi_boxes"] = rb
+
+            # seg_masks: dict -> tensor [7, Z', H, W] (padded same as image)
+            sample_img = record["image"]  # [5, Z, H, W]
+            Z_orig, H, W = sample_img.shape[1], sample_img.shape[2], sample_img.shape[3]
+            Z_out = max(Z_orig, self.min_z)
+            sm = torch.zeros(7, Z_out, H, W, dtype=torch.int64)
+            for i, d in enumerate(DISEASES):
+                m = seg_masks.get(d, None)
+                if m is not None and isinstance(m, torch.Tensor):
+                    sm[i, z_offset:z_offset + Z_orig] = m
+            out["localizer_mask"] = sm
 
         return out
 
@@ -241,68 +316,3 @@ class ShoulderDataset3D(Dataset):
             "labels": labels,   # [7]
             "mask": mask,       # [7]
         }
-
-
-# =========================================================================
-# Factory function
-# =========================================================================
-
-def create_dataset(
-    # --- common ---
-    label_mode="binary",
-    raw_labels_lookup=None,
-    batch_size=2,
-    num_workers=0,
-    shuffle_train=True,
-    # --- cache mode ---
-    source="cache_cls",
-    cache_index_csv=None,
-    # --- raw mode ---
-    exam_ids=None,
-    data_root=None,
-    json_root=None,
-    target_shape=(20, 448, 448),
-    mode_split="train",
-):
-    """Create a DataLoader for shoulder dataset.
-
-    Args:
-        source: "cache_cls", "cache_loc", or "raw"
-        cache_index_csv: required for cache modes
-        exam_ids, data_root, json_root: required for raw mode
-    """
-    label_mapper = LabelMapper(mode=label_mode)
-
-    if source in ("cache_cls", "cache_loc"):
-        if cache_index_csv is None:
-            raise ValueError("cache_index_csv required for source=%s" % source)
-        dataset = ShoulderCacheDataset(
-            cache_index_csv=cache_index_csv,
-            label_mapper=label_mapper,
-            raw_labels_lookup=raw_labels_lookup,
-            mode=source,
-        )
-    elif source == "raw":
-        if exam_ids is None or data_root is None or json_root is None:
-            raise ValueError("exam_ids, data_root, json_root required for source=raw")
-        dataset = ShoulderDataset3D(
-            exam_ids=exam_ids,
-            data_root=data_root,
-            json_root=json_root,
-            label_mapper=label_mapper,
-            raw_labels_lookup=raw_labels_lookup,
-            target_shape=target_shape,
-            mode=mode_split,
-        )
-    else:
-        raise ValueError("Unknown source: %s (use cache_cls/cache_loc/raw)" % source)
-
-    loader = torch.utils.data.DataLoader(
-        dataset,
-        batch_size=batch_size,
-        shuffle=(mode_split == "train" and shuffle_train),
-        num_workers=num_workers,
-        pin_memory=True,
-    )
-
-    return loader

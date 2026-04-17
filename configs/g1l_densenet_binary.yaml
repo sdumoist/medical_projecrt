@@ -6,6 +6,11 @@ data:
   json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
   nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
 
+  # Cache settings (localizer needs cache_loc)
+  use_cache: true
+  cache_mode: loc
+  cache_root: outputs/cache_loc
+
   sequences:
     - axial_PD
     - coronal_PD
@@ -52,6 +57,9 @@ training:
   loss: "bce"
 
   patience: 10
+
+  # Localizer loss weight
+  localizer_alpha: 0.2
 
 # Validation config
 validation:
