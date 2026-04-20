@@ -68,17 +68,43 @@ def compute_per_disease_metrics(
     y_true_all: np.ndarray,
     y_pred_all: np.ndarray,
     diseases: List[str],
-    binary: bool = True
+    binary: bool = True,
+    y_prob_all: np.ndarray = None,
+    mask_all: np.ndarray = None,
 ) -> Dict:
-    """Compute metrics per disease."""
+    """Compute metrics per disease.
+
+    Args:
+        y_true_all: [N, 7] ground-truth labels
+        y_pred_all: [N, 7] hard predictions
+        diseases: list of disease names
+        binary: whether to use binary metrics
+        y_prob_all: [N, 7] sigmoid probabilities (for AUC)
+        mask_all: [N, 7] label masks (1=valid, 0=ignore)
+    """
     results = {}
     for i, disease in enumerate(diseases):
         y_true = y_true_all[:, i]
         y_pred = y_pred_all[:, i]
+        y_prob = y_prob_all[:, i] if y_prob_all is not None else None
+
+        # Apply mask: only evaluate where label is valid
+        if mask_all is not None:
+            valid = mask_all[:, i] > 0
+            y_true = y_true[valid]
+            y_pred = y_pred[valid]
+            if y_prob is not None:
+                y_prob = y_prob[valid]
+
+        if len(y_true) == 0:
+            results[disease] = {
+                "accuracy": 0, "precision": 0, "recall": 0, "f1": 0}
+            continue
+
         if binary:
-            results[disease] = compute_metrics_binary(y_true, y_pred)
+            results[disease] = compute_metrics_binary(y_true, y_pred, y_prob)
         else:
-            results[disease] = compute_metrics_ternary(y_true, y_pred)
+            results[disease] = compute_metrics_ternary(y_true, y_pred, y_prob)
     return results
 
 

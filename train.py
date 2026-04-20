@@ -8,6 +8,7 @@ Supports:
 """
 import os
 import csv
+import json
 import yaml
 import argparse
 import warnings
@@ -28,6 +29,38 @@ from utils.metrics import compute_per_disease_metrics
 def load_config(config_path):
     with open(config_path, 'r') as f:
         return yaml.safe_load(f)
+
+
+def summarize_macro_metrics(metrics_dict):
+    """Compute macro-averaged metrics across 7 diseases.
+
+    Returns dict with avg_acc, avg_f1, avg_auc, avg_recall, avg_precision.
+    """
+    keys = ['accuracy', 'f1', 'auc', 'recall', 'precision']
+    summary = {}
+    for k in keys:
+        vals = []
+        for d in DISEASES:
+            if d in metrics_dict and k in metrics_dict[d]:
+                vals.append(metrics_dict[d][k])
+        summary['avg_' + k] = float(np.mean(vals)) if vals else 0.0
+    return summary
+
+
+def save_epoch_metrics_csv(csv_path, row_dict):
+    """Append one row to metrics CSV. Creates header on first call."""
+    file_exists = os.path.exists(csv_path)
+    with open(csv_path, 'a', newline='') as f:
+        writer = csv.DictWriter(f, fieldnames=list(row_dict.keys()))
+        if not file_exists:
+            writer.writeheader()
+        writer.writerow(row_dict)
+
+
+def save_epoch_metrics_jsonl(jsonl_path, epoch_record):
+    """Append one JSON line to metrics JSONL file."""
+    with open(jsonl_path, 'a') as f:
+        f.write(json.dumps(epoch_record, ensure_ascii=False) + '\n')
 
 
 def load_raw_labels(config):
@@ -253,6 +286,7 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
         loss_keys.append('localizer')
     total_losses = {k: 0.0 for k in loss_keys}
     all_preds = []
+    all_probs = []
     all_labels = []
     all_masks = []
     num_batches = 0
@@ -299,15 +333,20 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
             num_batches += 1
 
             preds = (torch.sigmoid(output['final_logits']) > 0.5).long()
+            probs = torch.sigmoid(output['final_logits'])
             all_preds.append(preds.cpu().numpy())
+            all_probs.append(probs.detach().cpu().numpy())
             all_labels.append(labels.cpu().numpy())
             all_masks.append(mask_labels.cpu().numpy())
 
     all_preds = np.concatenate(all_preds, axis=0)
+    all_probs = np.concatenate(all_probs, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
     all_masks = np.concatenate(all_masks, axis=0)
 
-    metrics = compute_per_disease_metrics(all_labels, all_preds, DISEASES, binary=True)
+    metrics = compute_per_disease_metrics(
+        all_labels, all_preds, DISEASES, binary=True,
+        y_prob_all=all_probs, mask_all=all_masks)
 
     for k in total_losses:
         metrics['loss_' + k] = total_losses[k] / max(num_batches, 1)
@@ -370,9 +409,12 @@ def train(config, output_dir):
     best_f1 = 0
     patience_counter = 0
     epochs = config['training']['max_epochs']
+    csv_path = os.path.join(output_dir, "metrics_epoch.csv")
+    jsonl_path = os.path.join(output_dir, "metrics_epoch.jsonl")
 
     for epoch in range(epochs):
-        print("[Epoch %d/%d] lr=%.6f" % (epoch + 1, epochs, optimizer.param_groups[0]['lr']))
+        cur_lr = optimizer.param_groups[0]['lr']
+        print("[Epoch %d/%d] lr=%.6f" % (epoch + 1, epochs, cur_lr))
 
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion, device, branch_alpha,
@@ -383,6 +425,14 @@ def train(config, output_dir):
                 model, val_loader, optimizer, criterion, device, branch_alpha,
                 "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer)
 
+            # --- Macro averages ---
+            train_macro = summarize_macro_metrics(train_metrics)
+            val_macro = summarize_macro_metrics(val_metrics)
+
+            avg_f1 = val_macro['avg_f1']
+            is_best = avg_f1 > best_f1
+
+            # --- Print losses ---
             print("Epoch %d/%d" % (epoch + 1, epochs))
             loss_str = "  Train Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f" % (
                 train_metrics['loss'], train_metrics['loss_final'],
@@ -402,15 +452,84 @@ def train(config, output_dir):
             loss_str += ")"
             print(loss_str)
 
-            print("  Per-disease F1:")
+            # --- Print per-disease metrics ---
+            print("  Per-disease metrics (val):")
+            print("    %-6s  %6s  %6s  %6s  %6s  %6s" % (
+                "", "F1", "AUC", "Recall", "Prec", "Acc"))
             for disease in DISEASES:
-                f1 = val_metrics[disease].get('f1', 0)
-                print("    %s: %.4f" % (disease, f1))
+                dm = val_metrics.get(disease, {})
+                print("    %-6s  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f" % (
+                    disease,
+                    dm.get('f1', 0),
+                    dm.get('auc', 0),
+                    dm.get('recall', 0),
+                    dm.get('precision', 0),
+                    dm.get('accuracy', 0)))
 
-            avg_f1 = np.mean([val_metrics[d].get('f1', 0) for d in DISEASES])
-            print("  Avg F1: %.4f (best: %.4f)" % (avg_f1, best_f1))
+            print("  Avg F1: %.4f  AUC: %.4f  Recall: %.4f  Prec: %.4f  (best F1: %.4f)" % (
+                val_macro['avg_f1'], val_macro['avg_auc'],
+                val_macro['avg_recall'], val_macro['avg_precision'], best_f1))
 
-            if avg_f1 > best_f1:
+            # --- Save CSV row ---
+            csv_row = {
+                'epoch': epoch + 1,
+                'lr': cur_lr,
+                'train_loss': train_metrics['loss'],
+                'val_loss': val_metrics['loss'],
+                'train_avg_acc': train_macro['avg_accuracy'],
+                'train_avg_f1': train_macro['avg_f1'],
+                'train_avg_auc': train_macro['avg_auc'],
+                'train_avg_recall': train_macro['avg_recall'],
+                'train_avg_precision': train_macro['avg_precision'],
+                'val_avg_acc': val_macro['avg_accuracy'],
+                'val_avg_f1': val_macro['avg_f1'],
+                'val_avg_auc': val_macro['avg_auc'],
+                'val_avg_recall': val_macro['avg_recall'],
+                'val_avg_precision': val_macro['avg_precision'],
+                'best_avg_f1': max(best_f1, avg_f1),
+                'is_best': int(is_best),
+            }
+            # Per-disease val F1/AUC in CSV
+            for d in DISEASES:
+                dm = val_metrics.get(d, {})
+                csv_row['%s_f1' % d] = dm.get('f1', 0)
+                csv_row['%s_auc' % d] = dm.get('auc', 0)
+                csv_row['%s_recall' % d] = dm.get('recall', 0)
+                csv_row['%s_precision' % d] = dm.get('precision', 0)
+            save_epoch_metrics_csv(csv_path, csv_row)
+
+            # --- Save JSONL record ---
+            jsonl_record = {
+                'epoch': epoch + 1,
+                'lr': cur_lr,
+                'train_loss': {k: train_metrics.get('loss_' + k, 0)
+                               for k in ['total', 'final', 'sag', 'cor', 'axi']},
+                'val_loss': {k: val_metrics.get('loss_' + k, 0)
+                             for k in ['total', 'final', 'sag', 'cor', 'axi']},
+                'train_macro': train_macro,
+                'val_macro': val_macro,
+                'train_per_disease': {d: train_metrics.get(d, {})
+                                      for d in DISEASES},
+                'val_per_disease': {d: val_metrics.get(d, {})
+                                    for d in DISEASES},
+                'best_avg_f1': max(best_f1, avg_f1),
+                'is_best': is_best,
+            }
+            save_epoch_metrics_jsonl(jsonl_path, jsonl_record)
+
+            # --- Save last_model.pt (every epoch) ---
+            last_path = os.path.join(output_dir, "last_model.pt")
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'metrics': val_metrics,
+                'branch_alpha': branch_alpha,
+                'config': config,
+            }, last_path)
+
+            # --- Save best_model.pt ---
+            if is_best:
                 best_f1 = avg_f1
                 save_path = os.path.join(output_dir, "best_model.pt")
                 torch.save({
