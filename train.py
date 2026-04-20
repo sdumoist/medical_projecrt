@@ -390,6 +390,11 @@ def train(config, output_dir):
     )
     model = model.to(device)
 
+    # Multi-GPU support
+    if torch.cuda.device_count() > 1:
+        print("Using %d GPUs with DataParallel" % torch.cuda.device_count())
+        model = nn.DataParallel(model)
+
     n_params = sum(p.numel() for p in model.parameters())
     print("Model parameters: %d (%.1fM)" % (n_params, n_params / 1e6))
 
@@ -518,10 +523,11 @@ def train(config, output_dir):
             save_epoch_metrics_jsonl(jsonl_path, jsonl_record)
 
             # --- Save last_model.pt (every epoch) ---
+            raw_model = model.module if hasattr(model, 'module') else model
             last_path = os.path.join(output_dir, "last_model.pt")
             torch.save({
                 'epoch': epoch,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': raw_model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'metrics': val_metrics,
                 'branch_alpha': branch_alpha,
@@ -534,7 +540,7 @@ def train(config, output_dir):
                 save_path = os.path.join(output_dir, "best_model.pt")
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': model.state_dict(),
+                    'model_state_dict': raw_model.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'metrics': val_metrics,
                     'branch_alpha': branch_alpha,
