@@ -146,6 +146,14 @@ class CoPAS_Shoulder(nn.Module):
         self.branch = kargs.active_branch
         self.dropout_rate = 0.05
         self.backbone = kargs.backbone
+        self.loss_type = getattr(kargs, 'loss_type', 'original')
+
+        # CB-ASL + SoftF1 losses (initialised lazily on first use if needed)
+        if self.loss_type == 'cbasl':
+            pos_counts = kargs.ClassDistr[1:]  # per-disease positive counts
+            self.cb_asl = ClassBalancedASL(pos_counts)
+            self.soft_f1 = SoftF1Loss()
+            self.softf1_weight = 0.2
 
         # Device: all modules init on CPU, use .cuda() + DataParallel externally
         self.device_list = ["cpu"] * 3
@@ -323,40 +331,49 @@ class CoPAS_Shoulder(nn.Module):
         pos_weights = torch.tensor(self.kargs.pos_weights, device=label.device)
 
         final_pred, sag_pred, cor_pred, axi_pred = pred
+
+        # --- Branch losses: always weighted BCE (keep simple) ---
         sag_loss = 0.0
         cor_loss = 0.0
         axi_loss = 0.0
-        final_loss = 0.0
         lossfunc = F.binary_cross_entropy_with_logits
-        lossfunc_final = Focal_Loss_with_logits
 
         for i in range(self.class_num):
-            if i == act_task or act_task == -1:
-                task_weight = task_weights[i]
-            else:
-                task_weight = 0.01
+            tw = task_weights[i] if (i == act_task or act_task == -1) else 0.01
             pos_wei = pos_weights[i]
-            subject_label = label[:, i:i + 1]
+            sl = label[:, i:i + 1]
 
             if self.branch[0]:
-                sag_loss += task_weight * lossfunc(
-                    sag_pred[:, i:i + 1], subject_label, pos_weight=pos_wei)
+                sag_loss += tw * lossfunc(sag_pred[:, i:i + 1], sl, pos_weight=pos_wei)
             if self.branch[1]:
-                cor_loss += task_weight * lossfunc(
-                    cor_pred[:, i:i + 1], subject_label, pos_weight=pos_wei)
+                cor_loss += tw * lossfunc(cor_pred[:, i:i + 1], sl, pos_weight=pos_wei)
             if self.branch[2]:
-                axi_loss += task_weight * lossfunc(
-                    axi_pred[:, i:i + 1], subject_label, pos_weight=pos_wei)
-            if final:
-                final_loss += task_weight * lossfunc_final(
-                    final_pred[:, i:i + 1], subject_label, pos_weight=pos_wei)
+                axi_loss += tw * lossfunc(axi_pred[:, i:i + 1], sl, pos_weight=pos_wei)
 
+        branch_loss = sag_loss + cor_loss + axi_loss
+
+        # --- Final head loss: depends on loss_type ---
+        final_loss = 0.0
+        if final:
+            if self.loss_type == 'cbasl':
+                # CB-ASL + SoftF1 on full [B, C] at once
+                final_loss = self.cb_asl(final_pred, label) \
+                             + self.softf1_weight * self.soft_f1(final_pred, label)
+            else:
+                # Original: per-disease focal loss
+                for i in range(self.class_num):
+                    tw = task_weights[i] if (i == act_task or act_task == -1) else 0.01
+                    final_loss += tw * Focal_Loss_with_logits(
+                        final_pred[:, i:i + 1], label[:, i:i + 1],
+                        pos_weight=pos_weights[i])
+
+        # --- Combine ---
         if sum(self.branch) == 1:
             loss = [sag_loss, cor_loss, axi_loss][self.branch.index(1)]
         elif final:
-            loss = self.kargs.alpha * (sag_loss + cor_loss + axi_loss) + final_loss
+            loss = self.kargs.alpha * branch_loss + final_loss
         else:
-            loss = sag_loss + cor_loss + axi_loss
+            loss = branch_loss
 
         return loss, loss.item()
 
@@ -404,18 +421,14 @@ def Focal_Loss_with_logits(pred, label, pos_weight=None, gamma=2, reduction='mea
         gamma:      focusing parameter (default 2)
         reduction:  'mean' | 'sum' | 'none'
     """
-    # numerically-stable BCE per element
     ce = F.binary_cross_entropy_with_logits(pred, label, reduction='none')
-
-    # p_t = probability assigned to the correct class
     p = torch.sigmoid(pred)
     p_t = p * label + (1 - p) * (1 - label)
     focal_weight = (1 - p_t) ** gamma
 
-    # class-balanced alpha (matches original CoPAS weighting)
     if pos_weight is not None:
-        alpha = pos_weight / (1 + pos_weight)          # weight for positive
-        alpha_t = label * alpha + (1 - label) * (1 - alpha)  # weight for negative
+        alpha = pos_weight / (1 + pos_weight)
+        alpha_t = label * alpha + (1 - label) * (1 - alpha)
         loss = alpha_t * focal_weight * ce
     else:
         loss = focal_weight * ce
@@ -425,3 +438,64 @@ def Focal_Loss_with_logits(pred, label, pos_weight=None, gamma=2, reduction='mea
     elif reduction == 'sum':
         return loss.sum()
     return loss
+
+
+# ------------------------------------------------------------------
+# CB-ASL + SoftF1 (multi-label long-tail losses)
+# ------------------------------------------------------------------
+class ClassBalancedASL(nn.Module):
+    """Class-Balanced Asymmetric Loss for multi-label classification.
+
+    Combines effective-number class-balanced weighting with asymmetric
+    gamma for positive/negative samples.  Designed for imbalanced
+    multi-label medical tasks.
+    """
+
+    def __init__(self, pos_counts, beta=0.9999, gamma_pos=1.0,
+                 gamma_neg=4.0, clip=0.05, eps=1e-8, max_weight=5.0):
+        super().__init__()
+        pc = torch.tensor(pos_counts, dtype=torch.float32)
+        weights = (1.0 - beta) / (1.0 - torch.pow(beta, pc))
+        weights = weights / weights.mean()
+        weights = torch.clamp(weights, max=max_weight)
+        self.register_buffer("class_weights", weights)  # [C]
+        self.gamma_pos = gamma_pos
+        self.gamma_neg = gamma_neg
+        self.clip = clip
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        """logits: [B, C], targets: [B, C] float 0/1."""
+        targets = targets.float()
+        p = torch.sigmoid(logits)
+
+        # positive part
+        loss_pos = targets * torch.log(p.clamp(min=self.eps)) \
+                   * (1.0 - p).pow(self.gamma_pos)
+
+        # negative part (with hard-thresholding clip)
+        p_neg = (1.0 - p + self.clip).clamp(max=1.0)
+        loss_neg = (1.0 - targets) * torch.log(p_neg.clamp(min=self.eps)) \
+                   * (1.0 - p_neg).pow(self.gamma_neg)
+
+        # class-balanced weight only on positive term
+        loss = -(self.class_weights.unsqueeze(0) * loss_pos + loss_neg)
+        return loss.mean()
+
+
+class SoftF1Loss(nn.Module):
+    """Differentiable macro soft-F1 loss."""
+
+    def __init__(self, eps=1e-8):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, logits, targets):
+        """logits: [B, C], targets: [B, C] float 0/1."""
+        p = torch.sigmoid(logits)
+        targets = targets.float()
+        tp = (p * targets).sum(dim=0)
+        fp = (p * (1 - targets)).sum(dim=0)
+        fn = ((1 - p) * targets).sum(dim=0)
+        soft_f1 = 2 * tp / (2 * tp + fp + fn + self.eps)
+        return (1 - soft_f1).mean()

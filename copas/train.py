@@ -119,6 +119,9 @@ class Config:
         parser.add_argument('--debug', action='store_true', default=self.debug)
         parser.add_argument('--gpu', type=str, default='0')
         parser.add_argument('--prefix', type=str, default='CoPAS')
+        parser.add_argument('--loss_type', type=str, default='original',
+                            choices=['original', 'cbasl'],
+                            help='original = focal+BCE, cbasl = CB-ASL+SoftF1')
 
         args, _ = parser.parse_known_args()
         for k, v in vars(args).items():
@@ -259,7 +262,7 @@ def main():
     n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
     # Experiment folder
-    exp_name = f"{cfg.prefix}_d{cfg.model_depth}_bs{cfg.batch_size}_{time.strftime('%m%d_%H%M%S')}"
+    exp_name = f"{cfg.prefix}_d{cfg.model_depth}_bs{cfg.batch_size}_{cfg.loss_type}_{time.strftime('%m%d_%H%M%S')}"
     exp_dir = os.path.join(cfg.exp_root, exp_name)
     os.makedirs(exp_dir, exist_ok=True)
 
@@ -273,7 +276,8 @@ def main():
 
     logging.info(f"Experiment: {exp_name}")
     logging.info(f"Config: epochs={cfg.epochs}, bs={cfg.batch_size}, lr={cfg.lr}, "
-                 f"depth={cfg.model_depth}, patience={cfg.patience}, gpus={n_gpus}")
+                 f"depth={cfg.model_depth}, patience={cfg.patience}, gpus={n_gpus}, "
+                 f"loss_type={cfg.loss_type}")
 
     # Data
     logging.info("Loading metadata...")
