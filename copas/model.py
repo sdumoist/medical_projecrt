@@ -13,8 +13,6 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from focal_loss.focal_loss import FocalLoss as FL
-
 from copas.resnet3d import generate_model as resnet3D
 
 
@@ -149,13 +147,8 @@ class CoPAS_Shoulder(nn.Module):
         self.dropout_rate = 0.05
         self.backbone = kargs.backbone
 
-        # Device setup
-        if torch.cuda.device_count() >= 3:
-            self.device_list = ["cuda:%d" % x for x in range(3)]
-        elif torch.cuda.is_available():
-            self.device_list = ["cuda:0"] * 3
-        else:
-            self.device_list = ["cpu"] * 3
+        # Device: all modules init on CPU, use .cuda() + DataParallel externally
+        self.device_list = ["cpu"] * 3
 
         self.__make_encoder__()
         self.__make_co_plane_att__()
@@ -306,6 +299,9 @@ class CoPAS_Shoulder(nn.Module):
 
     # ---- Forward ----
     def forward(self, input):
+        # Support stacked tensor [B, 5, C, Z, H, W] for DataParallel
+        if isinstance(input, torch.Tensor):
+            input = [input[:, i] for i in range(input.shape[1])]
         if self.branch[0]:
             sag_pred = self.__sag_branch__(input)
             final_pred = sag_pred
@@ -324,7 +320,7 @@ class CoPAS_Shoulder(nn.Module):
     # ---- Loss ----
     def criterion(self, pred, label, act_task=-1, final=False):
         task_weights = [1.0] * self.class_num
-        pos_weights = torch.tensor(self.kargs.pos_weights).cuda()
+        pos_weights = torch.tensor(self.kargs.pos_weights, device=label.device)
 
         final_pred, sag_pred, cor_pred, axi_pred = pred
         sag_loss = 0.0
@@ -399,17 +395,33 @@ class CoPAS_Shoulder(nn.Module):
 
 
 def Focal_Loss_with_logits(pred, label, pos_weight=None, gamma=2, reduction='mean'):
-    sigpred = torch.sigmoid(pred)
-    pred_cat = torch.cat((1 - sigpred, sigpred), dim=1)
+    """Binary focal loss — no external dependency.
+
+    Args:
+        pred:       logits, same shape as label (e.g. [B, 1])
+        label:      binary targets (0/1), float
+        pos_weight: scalar tensor, positive-class weight
+        gamma:      focusing parameter (default 2)
+        reduction:  'mean' | 'sum' | 'none'
+    """
+    # numerically-stable BCE per element
+    ce = F.binary_cross_entropy_with_logits(pred, label, reduction='none')
+
+    # p_t = probability assigned to the correct class
+    p = torch.sigmoid(pred)
+    p_t = p * label + (1 - p) * (1 - label)
+    focal_weight = (1 - p_t) ** gamma
+
+    # class-balanced alpha (matches original CoPAS weighting)
     if pos_weight is not None:
-        weight = torch.stack((1 / (1 + pos_weight), pos_weight / (1 + pos_weight)))
+        alpha = pos_weight / (1 + pos_weight)          # weight for positive
+        alpha_t = label * alpha + (1 - label) * (1 - alpha)  # weight for negative
+        loss = alpha_t * focal_weight * ce
     else:
-        weight = None
-    label = label.long()
-    fl = FL(gamma=gamma, weights=weight, reduction="none", eps=5e-6)
-    loss = fl(pred_cat, label)
-    if reduction == "mean":
-        loss = loss.sum() / loss.shape[0]
-    elif reduction == "sum":
-        loss = loss.sum()
+        loss = focal_weight * ce
+
+    if reduction == 'mean':
+        return loss.mean()
+    elif reduction == 'sum':
+        return loss.sum()
     return loss

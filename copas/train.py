@@ -6,8 +6,11 @@ adapted for shoulder MRI with 7 diseases and 5 sequences.
 
 Usage:
     cd /mnt/cfs_algo_bj/models/experiments/lirunze/code/project
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python copas/train.py
-    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python copas/train.py --epochs 100 --batch_size 2
+    # Single GPU
+    CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python copas/train.py --batch_size 4
+    # Multi-GPU (6 GPUs, total bs=24)
+    CUDA_VISIBLE_DEVICES=1,3,4,5,6,7 PYTHONPATH=. python copas/train.py --batch_size 24
+    # Debug
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python copas/train.py --debug
 """
 
@@ -24,6 +27,7 @@ import pickle
 import numpy as np
 from tqdm import tqdm
 import torch
+import torch.nn as nn
 import torch.optim as optim
 from torch.optim.lr_scheduler import ExponentialLR
 from torch import autocast
@@ -160,7 +164,7 @@ def evaluate_prediction(pred_list, label_list, disease_list):
 # ============================================================
 # Training
 # ============================================================
-def train_epoch(model, loader, optimizer, scaler, cfg):
+def train_epoch(model, raw_model, loader, optimizer, scaler, cfg):
     model.train()
     losses = []
     pred_list, label_list = [], []
@@ -173,16 +177,19 @@ def train_epoch(model, loader, optimizer, scaler, cfg):
             images = [img.cuda() for img in images]
             label = label.cuda()
 
+        # Stack for DataParallel: [B, 5, 1, Z, H, W]
+        images_stacked = torch.stack(images, dim=1)
+
         if cfg.half:
             with autocast(device_type='cuda', dtype=torch.float16):
-                logits = model(images)
-                loss, loss_val = model.criterion(logits, label, act_task=-1, final=final_active)
+                logits = model(images_stacked)
+                loss, loss_val = raw_model.criterion(logits, label, act_task=-1, final=final_active)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
             scaler.update()
         else:
-            logits = model(images)
-            loss, loss_val = model.criterion(logits, label, act_task=-1, final=final_active)
+            logits = model(images_stacked)
+            loss, loss_val = raw_model.criterion(logits, label, act_task=-1, final=final_active)
             loss.backward()
             optimizer.step()
 
@@ -199,7 +206,7 @@ def train_epoch(model, loader, optimizer, scaler, cfg):
     return np.mean(losses), results
 
 
-def evaluate_epoch(model, loader, cfg):
+def evaluate_epoch(model, raw_model, loader, cfg):
     model.eval()
     losses = []
     pred_list, label_list = [], []
@@ -210,8 +217,11 @@ def evaluate_epoch(model, loader, cfg):
             images = [img.cuda() for img in images]
             label = label.cuda()
 
-        logits = model(images)
-        _, loss_val = model.criterion(logits, label)
+        # Stack for DataParallel: [B, 5, 1, Z, H, W]
+        images_stacked = torch.stack(images, dim=1)
+
+        logits = model(images_stacked)
+        _, loss_val = raw_model.criterion(logits, label)
 
         probs = torch.sigmoid(logits[0]).detach().cpu().tolist()
         pred_list.extend(probs)
@@ -245,7 +255,8 @@ def save_metrics_jsonl(jsonl_path, record):
 def main():
     cfg = Config()
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = cfg.gpu
+    # GPU: controlled by CUDA_VISIBLE_DEVICES env var (don't override here)
+    n_gpus = torch.cuda.device_count() if torch.cuda.is_available() else 0
 
     # Experiment folder
     exp_name = f"{cfg.prefix}_d{cfg.model_depth}_bs{cfg.batch_size}_{time.strftime('%m%d_%H%M%S')}"
@@ -262,7 +273,7 @@ def main():
 
     logging.info(f"Experiment: {exp_name}")
     logging.info(f"Config: epochs={cfg.epochs}, bs={cfg.batch_size}, lr={cfg.lr}, "
-                 f"depth={cfg.model_depth}, patience={cfg.patience}")
+                 f"depth={cfg.model_depth}, patience={cfg.patience}, gpus={n_gpus}")
 
     # Data
     logging.info("Loading metadata...")
@@ -284,6 +295,12 @@ def main():
     model = CoPAS_Shoulder(cfg)
     if torch.cuda.is_available():
         model = model.cuda()
+        if n_gpus > 1:
+            model = nn.DataParallel(model)
+            logging.info(f"Using DataParallel on {n_gpus} GPUs")
+
+    # Unwrapped model reference for criterion / saving
+    raw_model = model.module if isinstance(model, nn.DataParallel) else model
 
     optimizer = optim.Adam(model.parameters(), lr=cfg.lr)
     scheduler = ExponentialLR(optimizer, gamma=0.9, verbose=False)
@@ -306,13 +323,13 @@ def main():
         val_loader = DataLoader(val_ds, batch_size=cfg.batch_size,
                                 num_workers=cfg.num_workers, shuffle=False)
 
-        train_loss, train_metrics = train_epoch(model, train_loader, optimizer, scaler, cfg)
+        train_loss, train_metrics = train_epoch(model, raw_model, train_loader, optimizer, scaler, cfg)
 
         if epoch % 10 == 0 and epoch > 0:
             scheduler.step()
 
         with torch.no_grad():
-            val_loss, val_metrics = evaluate_epoch(model, val_loader, cfg)
+            val_loss, val_metrics = evaluate_epoch(model, raw_model, val_loader, cfg)
 
         elapsed = time.time() - t0
 
@@ -354,12 +371,12 @@ def main():
             'val_macro_f1': val_macro_f1, 'val_macro_auc': val_macro_auc,
         })
 
-        # Save models
-        torch.save(model.state_dict(), os.path.join(exp_dir, "last_model.pt"))
+        # Save models (use raw_model to avoid DataParallel "module." prefix)
+        torch.save(raw_model.state_dict(), os.path.join(exp_dir, "last_model.pt"))
         if is_best:
             best_val_auc = val_macro_auc
-            torch.save(model.state_dict(), os.path.join(exp_dir, "best_model.pt"))
-            model.save_or_load_encoder_para(path=exp_dir)
+            torch.save(raw_model.state_dict(), os.path.join(exp_dir, "best_model.pt"))
+            raw_model.save_or_load_encoder_para(path=exp_dir)
             logging.info(f"  ** New best AUC: {best_val_auc:.4f} **")
 
         # Early stopping on val loss
