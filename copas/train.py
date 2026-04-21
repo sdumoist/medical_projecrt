@@ -143,16 +143,19 @@ def evaluate_prediction(pred_list, label_list, disease_list):
     results = {}
     for i, task in enumerate(disease_list):
         preds = prediction[:, i]
-        trues = label[:, i]
+        trues = label[:, i].astype(int)
         binary = (preds >= 0.5).astype(int)
         try:
             auc = roc_auc_score(trues, preds)
         except:
             auc = -1
-        acc = accuracy_score(trues, binary)
-        f1 = f1_score(trues, binary, zero_division=0)
-        prec = precision_score(trues, binary, zero_division=0)
-        rec = recall_score(trues, binary, zero_division=0)
+        try:
+            acc = accuracy_score(trues, binary)
+            f1 = f1_score(trues, binary, zero_division=0, pos_label=1)
+            prec = precision_score(trues, binary, zero_division=0, pos_label=1)
+            rec = recall_score(trues, binary, zero_division=0, pos_label=1)
+        except ValueError:
+            acc, f1, prec, rec = 0.0, 0.0, 0.0, 0.0
         results[task] = {'auc': auc, 'acc': acc, 'f1': f1,
                          'precision': prec, 'recall': rec}
 
