@@ -34,9 +34,11 @@ def load_config(config_path):
 def summarize_macro_metrics(metrics_dict):
     """Compute macro-averaged metrics across 7 diseases.
 
-    Returns dict with avg_acc, avg_f1, avg_auc, avg_recall, avg_precision.
+    Returns dict with avg_acc, avg_f1, avg_auc, avg_recall, avg_precision,
+    avg_opt_f1, avg_opt_precision, avg_opt_recall.
     """
-    keys = ['accuracy', 'f1', 'auc', 'recall', 'precision']
+    keys = ['accuracy', 'f1', 'auc', 'recall', 'precision',
+            'opt_f1', 'opt_precision', 'opt_recall']
     summary = {}
     for k in keys:
         vals = []
@@ -289,6 +291,9 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
     all_probs = []
     all_labels = []
     all_masks = []
+    all_pred_slices = []
+    all_gt_slices = []
+    all_slice_valid = []
     num_batches = 0
 
     try:
@@ -339,6 +344,16 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
             all_labels.append(labels.cpu().numpy())
             all_masks.append(mask_labels.cpu().numpy())
 
+            # Collect localizer slice predictions for metrics
+            if use_localizer and 'slice_logits' in output:
+                slice_logits = output['slice_logits']  # [B, 7, D']
+                pred_slice_idx = slice_logits.argmax(dim=2).cpu().numpy()  # [B, 7]
+                all_pred_slices.append(pred_slice_idx)
+                if "key_slices" in batch:
+                    gt_ks = batch["key_slices"].numpy()  # [B, 7]
+                    all_gt_slices.append(gt_ks)
+                    all_slice_valid.append((gt_ks >= 0).astype(np.float32))
+
     all_preds = np.concatenate(all_preds, axis=0)
     all_probs = np.concatenate(all_probs, axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
@@ -351,6 +366,15 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
     for k in total_losses:
         metrics['loss_' + k] = total_losses[k] / max(num_batches, 1)
     metrics['loss'] = metrics['loss_total']
+
+    # Compute key-slice metrics if localizer is active
+    if use_localizer and all_pred_slices and all_gt_slices:
+        from utils.metrics import compute_key_slice_metrics
+        pred_slices = np.concatenate(all_pred_slices, axis=0)
+        gt_slices = np.concatenate(all_gt_slices, axis=0)
+        slice_valid = np.concatenate(all_slice_valid, axis=0)
+        ks_metrics = compute_key_slice_metrics(pred_slices, gt_slices, slice_valid, DISEASES)
+        metrics['key_slice'] = ks_metrics
 
     return metrics
 
@@ -459,21 +483,29 @@ def train(config, output_dir):
 
             # --- Print per-disease metrics ---
             print("  Per-disease metrics (val):")
-            print("    %-6s  %6s  %6s  %6s  %6s  %6s" % (
-                "", "F1", "AUC", "Recall", "Prec", "Acc"))
+            print("    %-6s  %6s  %6s  %6s  %6s  %6s  %6s  %6s" % (
+                "", "F1", "AUC", "Recall", "Prec", "Acc", "OptF1", "OptThr"))
             for disease in DISEASES:
                 dm = val_metrics.get(disease, {})
-                print("    %-6s  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f" % (
+                print("    %-6s  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f  %5.2f" % (
                     disease,
                     dm.get('f1', 0),
                     dm.get('auc', 0),
                     dm.get('recall', 0),
                     dm.get('precision', 0),
-                    dm.get('accuracy', 0)))
+                    dm.get('accuracy', 0),
+                    dm.get('opt_f1', 0),
+                    dm.get('opt_thr', 0.5)))
 
-            print("  Avg F1: %.4f  AUC: %.4f  Recall: %.4f  Prec: %.4f  (best F1: %.4f)" % (
-                val_macro['avg_f1'], val_macro['avg_auc'],
+            print("  Avg F1: %.4f  AUC: %.4f  OptF1: %.4f  Recall: %.4f  Prec: %.4f  (best F1: %.4f)" % (
+                val_macro['avg_f1'], val_macro['avg_auc'], val_macro['avg_opt_f1'],
                 val_macro['avg_recall'], val_macro['avg_precision'], best_f1))
+
+            # Print key-slice metrics if available
+            if 'key_slice' in val_metrics:
+                ks = val_metrics['key_slice']
+                print("  Key-slice: top1=%.4f  pm1=%.4f" % (
+                    ks.get('macro_ks_top1', 0), ks.get('macro_ks_pm1', 0)))
 
             # --- Save CSV row ---
             csv_row = {
@@ -486,21 +518,30 @@ def train(config, output_dir):
                 'train_avg_auc': train_macro['avg_auc'],
                 'train_avg_recall': train_macro['avg_recall'],
                 'train_avg_precision': train_macro['avg_precision'],
+                'train_avg_opt_f1': train_macro['avg_opt_f1'],
                 'val_avg_acc': val_macro['avg_accuracy'],
                 'val_avg_f1': val_macro['avg_f1'],
                 'val_avg_auc': val_macro['avg_auc'],
                 'val_avg_recall': val_macro['avg_recall'],
                 'val_avg_precision': val_macro['avg_precision'],
+                'val_avg_opt_f1': val_macro['avg_opt_f1'],
                 'best_avg_f1': max(best_f1, avg_f1),
                 'is_best': int(is_best),
             }
-            # Per-disease val F1/AUC in CSV
+            # Per-disease val F1/AUC/opt in CSV
             for d in DISEASES:
                 dm = val_metrics.get(d, {})
                 csv_row['%s_f1' % d] = dm.get('f1', 0)
                 csv_row['%s_auc' % d] = dm.get('auc', 0)
                 csv_row['%s_recall' % d] = dm.get('recall', 0)
                 csv_row['%s_precision' % d] = dm.get('precision', 0)
+                csv_row['%s_opt_f1' % d] = dm.get('opt_f1', 0)
+                csv_row['%s_opt_thr' % d] = dm.get('opt_thr', 0.5)
+            # Key-slice metrics in CSV
+            if 'key_slice' in val_metrics:
+                ks = val_metrics['key_slice']
+                csv_row['macro_ks_top1'] = ks.get('macro_ks_top1', 0)
+                csv_row['macro_ks_pm1'] = ks.get('macro_ks_pm1', 0)
             save_epoch_metrics_csv(csv_path, csv_row)
 
             # --- Save JSONL record ---
@@ -520,6 +561,10 @@ def train(config, output_dir):
                 'best_avg_f1': max(best_f1, avg_f1),
                 'is_best': is_best,
             }
+            if 'key_slice' in val_metrics:
+                jsonl_record['val_key_slice'] = val_metrics['key_slice']
+            if 'key_slice' in train_metrics:
+                jsonl_record['train_key_slice'] = train_metrics['key_slice']
             save_epoch_metrics_jsonl(jsonl_path, jsonl_record)
 
             # --- Save last_model.pt (every epoch) ---
@@ -547,6 +592,28 @@ def train(config, output_dir):
                     'config': config,
                 }, save_path)
                 print("  Saved best model: %s" % save_path)
+
+                # --- Save best_thresholds.json ---
+                thresholds = {}
+                for d in DISEASES:
+                    dm = val_metrics.get(d, {})
+                    thresholds[d] = {
+                        'opt_thr': dm.get('opt_thr', 0.5),
+                        'opt_f1': dm.get('opt_f1', 0),
+                        'opt_precision': dm.get('opt_precision', 0),
+                        'opt_recall': dm.get('opt_recall', 0),
+                        'auc': dm.get('auc', 0),
+                    }
+                thresholds['_meta'] = {
+                    'epoch': epoch + 1,
+                    'val_macro_auc': val_macro['avg_auc'],
+                    'val_macro_f1': val_macro['avg_f1'],
+                    'val_macro_opt_f1': val_macro['avg_opt_f1'],
+                }
+                thr_path = os.path.join(output_dir, "best_thresholds.json")
+                with open(thr_path, 'w') as f:
+                    json.dump(thresholds, f, indent=2)
+                print("  Saved best thresholds: %s" % thr_path)
                 patience_counter = 0
             else:
                 patience_counter += 1
@@ -578,6 +645,11 @@ def main():
 
     os.makedirs(output_dir, exist_ok=True)
     print("Output directory: %s" % output_dir)
+
+    # Save resolved config
+    config_path = os.path.join(output_dir, "config_resolved.yaml")
+    with open(config_path, 'w') as f:
+        yaml.safe_dump(config, f, default_flow_style=False)
 
     model = train(config, output_dir)
 

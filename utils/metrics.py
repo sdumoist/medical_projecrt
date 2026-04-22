@@ -10,6 +10,36 @@ from typing import Dict, List, Tuple
 import torch
 
 
+def find_optimal_threshold(y_true, y_prob, metric='f1'):
+    """Find optimal threshold that maximizes F1 for a single disease.
+
+    Args:
+        y_true: [N] binary ground-truth labels
+        y_prob: [N] predicted probabilities
+        metric: optimization target ('f1')
+
+    Returns:
+        best_thr: optimal threshold
+        best_f1: F1 at optimal threshold
+        best_precision: precision at optimal threshold
+        best_recall: recall at optimal threshold
+    """
+    best_thr, best_f1 = 0.5, 0.0
+    best_precision, best_recall = 0.0, 0.0
+    for thr in np.arange(0.05, 0.96, 0.01):
+        binary = (y_prob >= thr).astype(int)
+        try:
+            val = f1_score(y_true, binary, zero_division=0, pos_label=1)
+        except ValueError:
+            val = 0.0
+        if val > best_f1:
+            best_f1 = val
+            best_thr = float(thr)
+            best_precision = precision_score(y_true, binary, zero_division=0)
+            best_recall = recall_score(y_true, binary, zero_division=0)
+    return best_thr, best_f1, best_precision, best_recall
+
+
 def compute_metrics_binary(
     y_true: np.ndarray,
     y_pred: np.ndarray,
@@ -28,6 +58,13 @@ def compute_metrics_binary(
             metrics["auc"] = roc_auc_score(y_true, y_prob)
         except:
             pass
+
+        # Optimal threshold search
+        opt_thr, opt_f1, opt_prec, opt_rec = find_optimal_threshold(y_true, y_prob)
+        metrics["opt_thr"] = opt_thr
+        metrics["opt_f1"] = opt_f1
+        metrics["opt_precision"] = opt_prec
+        metrics["opt_recall"] = opt_rec
 
     # Confusion matrix
     cm = confusion_matrix(y_true, y_pred)
@@ -135,3 +172,47 @@ def aggregate_metrics(metrics_list: List[Dict]) -> Dict:
             aggregated[f"{key}_std"] = np.std(values)
 
     return aggregated
+
+
+def compute_key_slice_metrics(
+    pred_slices: np.ndarray,
+    gt_slices: np.ndarray,
+    valid_mask: np.ndarray,
+    diseases: List[str],
+) -> Dict:
+    """Compute key-slice prediction accuracy per disease.
+
+    Args:
+        pred_slices: [N, 7] predicted key-slice indices (argmax of slice_logits)
+        gt_slices: [N, 7] ground-truth key-slice indices
+        valid_mask: [N, 7] mask for valid key-slice annotations (>= 0)
+        diseases: list of disease names
+
+    Returns:
+        dict with per-disease and macro key-slice metrics:
+            {disease}_ks_top1: exact match accuracy
+            {disease}_ks_pm1: +/- 1 slice accuracy
+            macro_ks_top1, macro_ks_pm1
+    """
+    results = {}
+    top1_list = []
+    pm1_list = []
+
+    for i, disease in enumerate(diseases):
+        valid = valid_mask[:, i] > 0
+        if valid.sum() == 0:
+            results[disease + "_ks_top1"] = 0.0
+            results[disease + "_ks_pm1"] = 0.0
+            continue
+        pred = pred_slices[valid, i]
+        gt = gt_slices[valid, i]
+        top1 = float((pred == gt).mean())
+        pm1 = float((np.abs(pred - gt) <= 1).mean())
+        results[disease + "_ks_top1"] = top1
+        results[disease + "_ks_pm1"] = pm1
+        top1_list.append(top1)
+        pm1_list.append(pm1)
+
+    results["macro_ks_top1"] = float(np.mean(top1_list)) if top1_list else 0.0
+    results["macro_ks_pm1"] = float(np.mean(pm1_list)) if pm1_list else 0.0
+    return results
