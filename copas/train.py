@@ -63,7 +63,8 @@ class Config:
     Keep_slice = True
 
     # Class distribution: [total, SST, IST, SSC, LHBT, IGHL, RIPI, GHOA]
-    ClassDistr = [7847, 6528, 2108, 1500, 1822, 2143, 2840, 2159]
+    # Updated after merging revised labels (non_high_summary_revised_merged_284.json)
+    ClassDistr = [7841, 6564, 2125, 1512, 1842, 2181, 2858, 2150]
 
     # Model
     backbone = "ResNet3D"
