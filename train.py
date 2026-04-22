@@ -5,6 +5,7 @@ Adapted for ShoulderCoPASModel with 3 PD branches + final head.
 Supports:
   - cache_cls / cache_loc / raw nii data sources
   - optional localizer loss for G1L / G2L
+  - binary (num_classes=2) and ternary (num_classes=3) classification
 """
 import os
 import csv
@@ -22,7 +23,7 @@ from utils.io import list_exam_ids, load_json_label
 from data.label_mapper import LabelMapper, create_train_val_split
 from data.shoulder_dataset import ShoulderCacheDataset, ShoulderDataset3D
 from models import create_model
-from utils.losses import MaskedBCEWithLogitsLoss
+from utils.losses import MaskedBCEWithLogitsLoss, MaskedCrossEntropyLoss
 from utils.metrics import compute_per_disease_metrics
 
 
@@ -122,7 +123,11 @@ def create_dataloaders(config, raw_labels_lookup, project_root):
     use_cache = config['data'].get('use_cache', False)
     cache_root = config['data'].get('cache_root', None)
 
-    label_mapper = LabelMapper(mode="binary")
+    # Determine task mode from num_classes (default binary)
+    num_classes = config['training'].get('num_classes', 2)
+    task_mode = "ternary" if num_classes == 3 else "binary"
+
+    label_mapper = LabelMapper(mode=task_mode)
     batch_size = config['training']['batch_size']
     num_workers = config['training']['num_workers']
 
@@ -145,7 +150,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root):
         # Get all exam IDs from raw_labels_lookup for splitting
         all_exam_ids = list(raw_labels_lookup.keys())
         train_ids, val_ids = create_train_val_split(
-            all_exam_ids, raw_labels_lookup, task_mode="binary", val_ratio=0.2)
+            all_exam_ids, raw_labels_lookup, task_mode=task_mode, val_ratio=0.2)
         train_id_set = set(train_ids)
         val_id_set = set(val_ids)
 
@@ -175,7 +180,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root):
 
         if raw_labels_lookup:
             train_ids, val_ids = create_train_val_split(
-                exam_ids, raw_labels_lookup, task_mode="binary", val_ratio=0.2)
+                exam_ids, raw_labels_lookup, task_mode=task_mode, val_ratio=0.2)
         else:
             np.random.seed(42)
             np.random.shuffle(exam_ids)
@@ -224,7 +229,8 @@ def create_dataloaders(config, raw_labels_lookup, project_root):
 
 
 def compute_total_loss(output, labels, mask, criterion, branch_alpha,
-                       localizer_alpha=0.0, batch=None, use_localizer=False):
+                       localizer_alpha=0.0, batch=None, use_localizer=False,
+                       num_classes=2):
     """Compute multi-branch loss with optional localizer loss.
 
     Loss = final_loss
@@ -279,9 +285,12 @@ def compute_total_loss(output, labels, mask, criterion, branch_alpha,
 
 
 def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
-                mode="train", localizer_alpha=0.0, use_localizer=False):
+                mode="train", localizer_alpha=0.0, use_localizer=False,
+                num_classes=2):
     """Train or validate for one epoch."""
     model.train() if mode == "train" else model.eval()
+
+    is_binary = (num_classes == 2)
 
     loss_keys = ['total', 'final', 'sag', 'cor', 'axi']
     if use_localizer:
@@ -327,6 +336,7 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 localizer_alpha=localizer_alpha,
                 batch=batch,
                 use_localizer=use_localizer,
+                num_classes=num_classes,
             )
 
             if mode == "train":
@@ -337,21 +347,41 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 total_losses[k] += loss_dict.get(k, 0.0)
             num_batches += 1
 
-            preds = (torch.sigmoid(output['final_logits']) > 0.5).long()
-            probs = torch.sigmoid(output['final_logits'])
+            # --- Predictions: binary vs ternary ---
+            if is_binary:
+                # Binary: sigmoid > 0.5
+                preds = (torch.sigmoid(output['final_logits']) > 0.5).long()
+                probs = torch.sigmoid(output['final_logits'])
+            else:
+                # Ternary: argmax over num_classes dim
+                # logits shape: [B, num_diseases, num_classes]
+                probs = torch.softmax(output['final_logits'], dim=2)
+                preds = probs.argmax(dim=2)  # [B, num_diseases]
+
             all_preds.append(preds.cpu().numpy())
             all_probs.append(probs.detach().cpu().numpy())
             all_labels.append(labels.cpu().numpy())
             all_masks.append(mask_labels.cpu().numpy())
 
             # Collect localizer slice predictions for metrics
+            # NOTE: pred_slice_idx is in D' (feature) space.
+            #       gt key_slices are in Z (input) space.
+            #       We rescale gt to D' space here to match, same as in loss.
             if use_localizer and 'slice_logits' in output:
                 slice_logits = output['slice_logits']  # [B, 7, D']
+                D_prime = slice_logits.shape[2]
                 pred_slice_idx = slice_logits.argmax(dim=2).cpu().numpy()  # [B, 7]
                 all_pred_slices.append(pred_slice_idx)
                 if "key_slices" in batch:
-                    gt_ks = batch["key_slices"].numpy()  # [B, 7]
-                    all_gt_slices.append(gt_ks)
+                    gt_ks = batch["key_slices"].numpy()  # [B, 7] in Z space
+                    input_Z = batch["image"].shape[3]     # Z dimension of input
+                    # Rescale gt from Z space to D' space (same as loss)
+                    gt_ks_scaled = np.where(
+                        gt_ks >= 0,
+                        np.clip((gt_ks * D_prime / input_Z).astype(int), 0, D_prime - 1),
+                        gt_ks  # keep -1 for invalid
+                    )
+                    all_gt_slices.append(gt_ks_scaled)
                     all_slice_valid.append((gt_ks >= 0).astype(np.float32))
 
     all_preds = np.concatenate(all_preds, axis=0)
@@ -359,9 +389,12 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
     all_labels = np.concatenate(all_labels, axis=0)
     all_masks = np.concatenate(all_masks, axis=0)
 
+    # For binary: y_prob_all is [N, 7] sigmoid probabilities
+    # For ternary: y_prob_all is [N, 7, 3] softmax probabilities
     metrics = compute_per_disease_metrics(
-        all_labels, all_preds, DISEASES, binary=True,
-        y_prob_all=all_probs, mask_all=all_masks)
+        all_labels, all_preds, DISEASES, binary=is_binary,
+        y_prob_all=all_probs,
+        mask_all=all_masks)
 
     for k in total_losses:
         metrics['loss_' + k] = total_losses[k] / max(num_batches, 1)
@@ -401,6 +434,12 @@ def train(config, output_dir):
     if use_localizer:
         print("Localizer enabled: alpha=%.3f" % localizer_alpha)
 
+    # Task mode
+    num_classes = config['training'].get('num_classes', 2)
+    is_binary = (num_classes == 2)
+    task_mode = "ternary" if num_classes == 3 else "binary"
+    print("Task mode: %s (num_classes=%d)" % (task_mode, num_classes))
+
     # Create model
     branch_alpha = config['training'].get('branch_alpha', 0.3)
     model = create_model(
@@ -411,6 +450,7 @@ def train(config, output_dir):
         num_heads=config['model'].get('num_heads', 4),
         branch_alpha=branch_alpha,
         use_localizer=use_localizer,
+        num_classes=num_classes,
     )
     model = model.to(device)
 
@@ -422,7 +462,12 @@ def train(config, output_dir):
     n_params = sum(p.numel() for p in model.parameters())
     print("Model parameters: %d (%.1fM)" % (n_params, n_params / 1e6))
 
-    criterion = MaskedBCEWithLogitsLoss()
+    # Loss function
+    if is_binary:
+        criterion = MaskedBCEWithLogitsLoss()
+    else:
+        label_smoothing = config['training'].get('label_smoothing', 0.0)
+        criterion = MaskedCrossEntropyLoss(label_smoothing=label_smoothing)
 
     optimizer = torch.optim.Adam(
         model.parameters(),
@@ -447,12 +492,14 @@ def train(config, output_dir):
 
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion, device, branch_alpha,
-            "train", localizer_alpha=localizer_alpha, use_localizer=use_localizer)
+            "train", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
+            num_classes=num_classes)
 
         if (epoch + 1) % config['validation']['val_interval'] == 0:
             val_metrics = train_epoch(
                 model, val_loader, optimizer, criterion, device, branch_alpha,
-                "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer)
+                "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
+                num_classes=num_classes)
 
             # --- Macro averages ---
             train_macro = summarize_macro_metrics(train_metrics)

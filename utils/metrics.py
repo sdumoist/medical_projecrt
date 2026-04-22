@@ -81,20 +81,32 @@ def compute_metrics_ternary(
     y_pred: np.ndarray,
     y_prob: np.ndarray = None
 ) -> Dict:
-    """Compute multi-class classification metrics (3 classes: negative, uncertain, positive)."""
+    """Compute multi-class classification metrics (3 classes: 0=neg, 1=unc, 2=pos).
+
+    Label mapping (from label_mapper.py ternary mode):
+        raw 0 -> train 0 (negative)
+        raw 2 -> train 1 (uncertain)
+        raw 1 -> train 2 (positive)
+    """
     metrics = {
         "accuracy": accuracy_score(y_true, y_pred),
         "precision_neg": precision_score(y_true == 0, y_pred == 0, zero_division=0),
-        "precision_unc": precision_score(y_true == 2, y_pred == 2, zero_division=0),
-        "precision_pos": precision_score(y_true == 1, y_pred == 1, zero_division=0),
+        "precision_unc": precision_score(y_true == 1, y_pred == 1, zero_division=0),
+        "precision_pos": precision_score(y_true == 2, y_pred == 2, zero_division=0),
         "recall_neg": recall_score(y_true == 0, y_pred == 0, zero_division=0),
-        "recall_unc": recall_score(y_true == 2, y_pred == 2, zero_division=0),
-        "recall_pos": recall_score(y_true == 1, y_pred == 1, zero_division=0),
+        "recall_unc": recall_score(y_true == 1, y_pred == 1, zero_division=0),
+        "recall_pos": recall_score(y_true == 2, y_pred == 2, zero_division=0),
+        "f1_neg": f1_score(y_true == 0, y_pred == 0, zero_division=0),
+        "f1_unc": f1_score(y_true == 1, y_pred == 1, zero_division=0),
+        "f1_pos": f1_score(y_true == 2, y_pred == 2, zero_division=0),
     }
+    # Macro F1 across 3 classes
+    metrics["f1"] = float(np.mean([metrics["f1_neg"], metrics["f1_unc"], metrics["f1_pos"]]))
 
-    if y_prob is not None and y_prob.ndim == 2:
+    if y_prob is not None and y_prob.ndim == 2 and y_prob.shape[1] >= 3:
         try:
-            metrics["auc_macro"] = roc_auc_score(y_prob, y_true, multi_class='ovr', average='macro')
+            metrics["auc_macro"] = roc_auc_score(
+                y_true, y_prob, multi_class='ovr', average='macro')
         except:
             pass
 
@@ -116,14 +128,20 @@ def compute_per_disease_metrics(
         y_pred_all: [N, 7] hard predictions
         diseases: list of disease names
         binary: whether to use binary metrics
-        y_prob_all: [N, 7] sigmoid probabilities (for AUC)
+        y_prob_all: binary: [N, 7] sigmoid probs; ternary: [N, 7, 3] softmax probs
         mask_all: [N, 7] label masks (1=valid, 0=ignore)
     """
     results = {}
     for i, disease in enumerate(diseases):
         y_true = y_true_all[:, i]
         y_pred = y_pred_all[:, i]
-        y_prob = y_prob_all[:, i] if y_prob_all is not None else None
+        if y_prob_all is not None:
+            if binary:
+                y_prob = y_prob_all[:, i]       # [N]
+            else:
+                y_prob = y_prob_all[:, i, :]    # [N, 3]
+        else:
+            y_prob = None
 
         # Apply mask: only evaluate where label is valid
         if mask_all is not None:

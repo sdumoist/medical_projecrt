@@ -10,31 +10,41 @@ import torch.nn as nn
 
 
 class BranchHead(nn.Module):
-    """Binary classification head for a single branch.
+    """Classification head for a single branch.
 
     Args:
         input_dim: feature dimension from fusion output
         num_diseases: number of diseases this branch predicts
         dropout: dropout rate
+        num_classes: 2 for binary (output [B, num_diseases]),
+                     3 for ternary (output [B, num_diseases, num_classes])
     """
 
-    def __init__(self, input_dim, num_diseases, dropout=0.3):
+    def __init__(self, input_dim, num_diseases, dropout=0.3, num_classes=2):
         super().__init__()
+        self.num_classes = num_classes
+        out_dim = num_diseases if num_classes == 2 else num_diseases * num_classes
         self.fc = nn.Sequential(
             nn.Linear(input_dim, input_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(input_dim // 2, num_diseases)
+            nn.Linear(input_dim // 2, out_dim)
         )
+        self.num_diseases = num_diseases
 
     def forward(self, x):
         """
         Args:
             x: [B, input_dim]
         Returns:
-            logits: [B, num_diseases]
+            binary:  logits [B, num_diseases]
+            ternary: logits [B, num_diseases, num_classes]
         """
-        return self.fc(x)
+        out = self.fc(x)
+        if self.num_classes > 2:
+            B = out.shape[0]
+            out = out.view(B, self.num_diseases, self.num_classes)
+        return out
 
 
 class FinalHead(nn.Module):
@@ -47,16 +57,21 @@ class FinalHead(nn.Module):
         num_branches: number of branches (3: sag, cor, axi)
         num_diseases: total number of diseases (7)
         dropout: dropout rate
+        num_classes: 2 for binary, 3 for ternary
     """
 
-    def __init__(self, branch_dim, num_branches, num_diseases, dropout=0.3):
+    def __init__(self, branch_dim, num_branches, num_diseases, dropout=0.3,
+                 num_classes=2):
         super().__init__()
+        self.num_classes = num_classes
+        self.num_diseases = num_diseases
         total_dim = branch_dim * num_branches
+        out_dim = num_diseases if num_classes == 2 else num_diseases * num_classes
         self.fc = nn.Sequential(
             nn.Linear(total_dim, total_dim // 2),
             nn.ReLU(),
             nn.Dropout(dropout),
-            nn.Linear(total_dim // 2, num_diseases)
+            nn.Linear(total_dim // 2, out_dim)
         )
 
     def forward(self, branch_feats):
@@ -65,7 +80,12 @@ class FinalHead(nn.Module):
             branch_feats: list of [B, branch_dim] tensors, one per branch
 
         Returns:
-            logits: [B, num_diseases]
+            binary:  logits [B, num_diseases]
+            ternary: logits [B, num_diseases, num_classes]
         """
         x = torch.cat(branch_feats, dim=1)  # [B, total_dim]
-        return self.fc(x)
+        out = self.fc(x)
+        if self.num_classes > 2:
+            B = out.shape[0]
+            out = out.view(B, self.num_diseases, self.num_classes)
+        return out

@@ -74,7 +74,7 @@ class SliceHead(nn.Module):
 
 
 class ShoulderCoPASModel(nn.Module):
-    """CoPAS 3-branch model for shoulder MRI classification (binary).
+    """CoPAS 3-branch model for shoulder MRI classification.
 
     Args:
         encoder_name: encoder type, e.g. "resnet3d_18", "densenet121"
@@ -84,6 +84,7 @@ class ShoulderCoPASModel(nn.Module):
         num_heads: number of attention heads in CoPlaneAttention
         branch_alpha: weight for auxiliary branch losses
         use_localizer: whether to enable key-slice prediction head
+        num_classes: 2 for binary, 3 for ternary
     """
 
     def __init__(
@@ -95,11 +96,13 @@ class ShoulderCoPASModel(nn.Module):
         num_heads=4,
         branch_alpha=0.3,
         use_localizer=False,
+        num_classes=2,
     ):
         super().__init__()
         self.num_diseases = num_diseases
         self.branch_alpha = branch_alpha
         self.use_localizer = use_localizer
+        self.num_classes = num_classes
 
         # --- 5 independent encoders (one per sequence) ---
         self.encoders = nn.ModuleDict()
@@ -125,11 +128,12 @@ class ShoulderCoPASModel(nn.Module):
         # no cross-modal for axial
 
         # --- Heads ---
-        self.sag_head = BranchHead(feat_dim, num_diseases, dropout)
-        self.cor_head = BranchHead(feat_dim, num_diseases, dropout)
-        self.axi_head = BranchHead(feat_dim, num_diseases, dropout)
+        self.sag_head = BranchHead(feat_dim, num_diseases, dropout, num_classes)
+        self.cor_head = BranchHead(feat_dim, num_diseases, dropout, num_classes)
+        self.axi_head = BranchHead(feat_dim, num_diseases, dropout, num_classes)
         self.final_head = FinalHead(feat_dim, num_branches=3,
-                                     num_diseases=num_diseases, dropout=dropout)
+                                     num_diseases=num_diseases, dropout=dropout,
+                                     num_classes=num_classes)
 
         # --- Localizer: key-slice prediction ---
         if use_localizer:
@@ -215,7 +219,7 @@ class ShoulderCoPASModel(nn.Module):
 
 def create_model(encoder="resnet3d_18", num_diseases=7, pretrained=False,
                  dropout=0.3, num_heads=4, branch_alpha=0.3,
-                 use_localizer=False, **kwargs):
+                 use_localizer=False, num_classes=2, **kwargs):
     """Create ShoulderCoPASModel from config."""
     return ShoulderCoPASModel(
         encoder_name=encoder,
@@ -225,4 +229,5 @@ def create_model(encoder="resnet3d_18", num_diseases=7, pretrained=False,
         num_heads=num_heads,
         branch_alpha=branch_alpha,
         use_localizer=use_localizer,
+        num_classes=num_classes,
     )
