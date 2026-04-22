@@ -136,14 +136,38 @@ class Config:
 # ============================================================
 # Metrics
 # ============================================================
+def find_optimal_threshold(trues, preds, metric='f1'):
+    """Sweep thresholds to find the one maximizing F1 for a single disease."""
+    best_thr, best_val = 0.5, 0.0
+    for thr in np.arange(0.05, 0.96, 0.01):
+        binary = (preds >= thr).astype(int)
+        try:
+            val = f1_score(trues, binary, zero_division=0, pos_label=1)
+        except ValueError:
+            val = 0.0
+        if val > best_val:
+            best_val = val
+            best_thr = float(thr)
+    return best_thr, best_val
+
+
 def evaluate_prediction(pred_list, label_list, disease_list):
-    """Compute per-disease AUC, ACC, F1 and overall metrics."""
-    prediction = np.array(pred_list)
-    label = np.array(label_list)
+    """Compute per-disease AUC, ACC, F1 and overall metrics.
+
+    Reports both fixed-0.5 threshold and per-disease optimal threshold.
+    """
+    prediction = np.array(pred_list, dtype=np.float32)
+    label = np.array(label_list, dtype=np.int64)
+
+    # Safety guard: ensure binary labels (map any 2 -> 0, clip to [0,1])
+    label = np.where(label == 2, 0, label)
+    label = np.clip(label, 0, 1)
     results = {}
     for i, task in enumerate(disease_list):
         preds = prediction[:, i]
-        trues = label[:, i].astype(int)
+        trues = label[:, i]
+
+        # Fixed threshold = 0.5
         binary = (preds >= 0.5).astype(int)
         try:
             auc = roc_auc_score(trues, preds)
@@ -156,14 +180,30 @@ def evaluate_prediction(pred_list, label_list, disease_list):
             rec = recall_score(trues, binary, zero_division=0, pos_label=1)
         except ValueError:
             acc, f1, prec, rec = 0.0, 0.0, 0.0, 0.0
-        results[task] = {'auc': auc, 'acc': acc, 'f1': f1,
-                         'precision': prec, 'recall': rec}
 
-    # Overall
-    binary_all = (prediction >= 0.5).astype(int)
-    results['macro_f1'] = f1_score(label, binary_all, average='macro', zero_division=0)
-    results['macro_auc'] = np.mean([v['auc'] for v in results.values()
-                                     if isinstance(v, dict) and v.get('auc', -1) > 0])
+        # Optimal threshold (maximize F1)
+        opt_thr, opt_f1 = find_optimal_threshold(trues, preds)
+        opt_binary = (preds >= opt_thr).astype(int)
+        try:
+            opt_prec = precision_score(trues, opt_binary, zero_division=0, pos_label=1)
+            opt_rec = recall_score(trues, opt_binary, zero_division=0, pos_label=1)
+        except ValueError:
+            opt_prec, opt_rec = 0.0, 0.0
+
+        results[task] = {
+            'auc': auc, 'acc': acc,
+            'f1': f1, 'precision': prec, 'recall': rec,
+            'opt_thr': opt_thr, 'opt_f1': opt_f1,
+            'opt_precision': opt_prec, 'opt_recall': opt_rec,
+        }
+
+    # Overall — aggregate from per-disease results
+    valid_f1s = [results[d]['f1'] for d in disease_list]
+    valid_aucs = [results[d]['auc'] for d in disease_list if results[d]['auc'] > 0]
+    opt_f1s = [results[d]['opt_f1'] for d in disease_list]
+    results['macro_f1'] = float(np.mean(valid_f1s)) if valid_f1s else 0.0
+    results['macro_auc'] = float(np.mean(valid_aucs)) if valid_aucs else 0.0
+    results['macro_opt_f1'] = float(np.mean(opt_f1s)) if opt_f1s else 0.0
     return results
 
 
@@ -343,23 +383,29 @@ def main():
         # Log
         val_macro_f1 = val_metrics.get('macro_f1', 0)
         val_macro_auc = val_metrics.get('macro_auc', 0)
+        val_macro_opt_f1 = val_metrics.get('macro_opt_f1', 0)
         is_best = val_macro_auc > best_val_auc
 
         logging.info(
             f"Epoch {epoch+1}/{cfg.epochs} ({elapsed:.0f}s) lr={lr:.6f}\n"
             f"  Train Loss: {train_loss:.4f} | macro_f1={train_metrics.get('macro_f1',0):.4f}\n"
-            f"  Val   Loss: {val_loss:.4f} | macro_f1={val_macro_f1:.4f} | macro_auc={val_macro_auc:.4f}\n"
-            f"  Per-disease F1/AUC:")
+            f"  Val   Loss: {val_loss:.4f} | macro_f1={val_macro_f1:.4f} | "
+            f"macro_opt_f1={val_macro_opt_f1:.4f} | macro_auc={val_macro_auc:.4f}\n"
+            f"  Per-disease (thr=0.5 / optimal):")
         for d in cfg.DiseaseList:
             dm = val_metrics.get(d, {})
-            logging.info(f"    {d}: F1={dm.get('f1',0):.4f}  AUC={dm.get('auc',0):.4f}  "
-                         f"Prec={dm.get('precision',0):.4f}  Rec={dm.get('recall',0):.4f}")
+            logging.info(
+                f"    {d}: F1={dm.get('f1',0):.4f}  AUC={dm.get('auc',0):.4f}  "
+                f"Prec={dm.get('precision',0):.4f}  Rec={dm.get('recall',0):.4f}"
+                f"  | opt_thr={dm.get('opt_thr',0.5):.2f}  opt_F1={dm.get('opt_f1',0):.4f}"
+                f"  opt_P={dm.get('opt_precision',0):.4f}  opt_R={dm.get('opt_recall',0):.4f}")
 
         # Save metrics
         row = {
             'epoch': epoch + 1, 'lr': lr,
             'train_loss': train_loss, 'val_loss': val_loss,
             'val_macro_f1': val_macro_f1, 'val_macro_auc': val_macro_auc,
+            'val_macro_opt_f1': val_macro_opt_f1,
             'best_val_auc': max(best_val_auc, val_macro_auc),
             'is_best': int(is_best),
         }
@@ -369,6 +415,8 @@ def main():
             row[f'{d}_auc'] = dm.get('auc', 0)
             row[f'{d}_recall'] = dm.get('recall', 0)
             row[f'{d}_precision'] = dm.get('precision', 0)
+            row[f'{d}_opt_thr'] = dm.get('opt_thr', 0.5)
+            row[f'{d}_opt_f1'] = dm.get('opt_f1', 0)
         save_metrics_csv(csv_path, row)
         save_metrics_jsonl(jsonl_path, {
             'epoch': epoch + 1, 'lr': lr,
@@ -376,6 +424,7 @@ def main():
             'train_metrics': {k: v for k, v in train_metrics.items() if isinstance(v, dict)},
             'val_metrics': {k: v for k, v in val_metrics.items() if isinstance(v, dict)},
             'val_macro_f1': val_macro_f1, 'val_macro_auc': val_macro_auc,
+            'val_macro_opt_f1': val_macro_opt_f1,
         })
 
         # Save models (use raw_model to avoid DataParallel "module." prefix)

@@ -39,10 +39,23 @@ def load_metadata(metadata_csv, cache_root):
         valid = True
         for d in DISEASES:
             val = row.get('raw_label_' + d, -1)
-            if pd.isna(val) or val == -1:
+
+            if pd.isna(val):
                 valid = False
                 break
-            labels.append(int(val))
+
+            val = int(val)
+
+            # -1: postop / unmappable -> drop case
+            if val == -1:
+                valid = False
+                break
+
+            # binary policy: uncertain (2) -> negative (0)
+            if val == 2:
+                val = 0
+
+            labels.append(val)
         if valid:
             label_lookup[eid] = labels
             valid_ids.append(eid)
