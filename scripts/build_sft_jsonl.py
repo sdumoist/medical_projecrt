@@ -102,16 +102,37 @@ def compute_train_policy(case_data):
 
 # ── Output builders ──────────────────────────────────────────────────────
 
+def map_label_to_binary(raw_label):
+    """Map raw label to binary: 1=positive, 0=negative/uncertain, -1=masked.
+
+    Mapping:
+        1  -> 1 (positive)
+        0  -> 0 (negative)
+        2  -> 0 (uncertain, mapped to negative for binary task)
+        -1 -> -1 (masked / unavailable)
+    """
+    if raw_label == 1:
+        return 1
+    if raw_label in (0, 2):
+        return 0
+    return -1
+
+
 def build_label_binary_output(case_data):
-    """Build output string for label_binary task."""
+    """Build output string for label_binary task.
+
+    Labels are strictly binary (1/0/-1). raw_label=2 (uncertain) is
+    mapped to 0 with status preserved as "uncertain".
+    """
     labels = case_data.get("labels", {})
     label_status = case_data.get("label_status", {})
 
     result = {"labels": {}}
     for d in DISEASES:
         raw_label = labels.get(d, -1)
+        binary_label = map_label_to_binary(raw_label)
         status = label_status.get(d, "unknown")
-        result["labels"][d] = {"label": raw_label, "status": status}
+        result["labels"][d] = {"label": binary_label, "status": status}
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -137,7 +158,7 @@ def build_diagnosis_chain_output(case_data, loc_data=None):
 
     for d in DISEASES:
         raw_label = labels.get(d, -1)
-        result["labels"][d] = raw_label
+        result["labels"][d] = map_label_to_binary(raw_label)
 
         result["evidence"][d] = {
             "positive": evidence_text.get(d, []),

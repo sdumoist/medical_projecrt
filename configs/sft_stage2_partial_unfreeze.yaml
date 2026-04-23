@@ -19,7 +19,7 @@ projector:
 # LLM (same LoRA config as Stage 1)
 llm:
   model_name: "Qwen/Qwen2.5-7B"
-  model_path: "Qwen/Qwen2.5-7B"
+  model_path: "/mnt/cfs_algo_bj/models/opensource_model/Qwen/Qwen2.5-7B"
   lora_rank: 16                   # Keep same as Stage 1
   lora_alpha: 32
   lora_dropout: 0.05

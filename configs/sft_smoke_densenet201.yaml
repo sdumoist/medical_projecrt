@@ -1,19 +1,11 @@
-# Stage 3: Full fine-tuning (placeholder)
-# NOT IMPLEMENTED - config only, no code support yet.
-#
-# When implemented:
-#   - Unfreeze all MRI-CV layers
-#   - Merge LoRA into base model or continue with LoRA
-#   - Very low LR (1e-5), short training (1-2 epochs)
-#   - Requires careful gradient scaling between vision and language
-stage: 3
+# Smoke test: densenet201 encoder (g1_densenet201_binary, best F1=0.510)
+stage: 1
 
 mri_cv:
-  encoder: "swin3d_tiny"
-  checkpoint_path: "outputs/experiments/g3_swin_binary/best_model.pt"
+  encoder: "densenet201"
+  checkpoint_path: "outputs/experiments/g1_densenet201_binary/best_model.pt"
   use_localizer: false
-  freeze: false
-  unfreeze_layers: "all"
+  freeze: true
 
 projector:
   num_visual_tokens: 3
@@ -33,19 +25,18 @@ data:
   cache_root: "outputs/cache_cls"
   cache_mode: "cls"
   cache_index: "outputs/cache_cls/cache_cls_index.csv"
-  max_seq_length: 2048
+  max_seq_length: 1024
   train_jsonl:
     - "outputs/sft_data/split/sft_label_binary_train.jsonl"
-    - "outputs/sft_data/split/sft_diagnosis_chain_train.jsonl"
   val_jsonl:
     - "outputs/sft_data/split/sft_label_binary_val.jsonl"
 
 training:
   batch_size: 1
-  gradient_accumulation_steps: 8
-  num_workers: 4
+  gradient_accumulation_steps: 1
+  num_workers: 0
   max_epochs: 2
-  learning_rate: 0.00001          # 1e-5 (very low)
+  learning_rate: 0.0002
   weight_decay: 0.01
   warmup_ratio: 0.03
   max_grad_norm: 1.0
@@ -53,8 +44,8 @@ training:
 
 validation:
   val_interval: 1
-  generation_max_length: 512
+  generation_max_length: 256
 
 output:
-  exp_name: "sft_stage3_full_ft"
+  exp_name: "sft_smoke_densenet201"
   output_dir: "outputs/sft_experiments"

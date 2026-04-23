@@ -16,7 +16,7 @@ projector:
 # LLM
 llm:
   model_name: "Qwen/Qwen2.5-7B"
-  model_path: "Qwen/Qwen2.5-7B"   # Set to local path on cluster
+  model_path: "/mnt/cfs_algo_bj/models/opensource_model/Qwen/Qwen2.5-7B"
   lora_rank: 16
   lora_alpha: 32
   lora_dropout: 0.05

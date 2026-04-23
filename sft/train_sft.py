@@ -117,6 +117,20 @@ class ShoulderSFTModel(nn.Module):
         merged[:, :N, :] = visual_tokens
         return merged
 
+    def _get_embed_fn(self):
+        """Get the embed_tokens function, handling PeftModel wrapping."""
+        # PeftModel -> base_model -> model -> model -> embed_tokens
+        llm = self.llm
+        if hasattr(llm, "base_model"):
+            llm = llm.base_model
+        if hasattr(llm, "model"):
+            inner = llm.model
+            if hasattr(inner, "embed_tokens"):
+                return inner.embed_tokens
+            if hasattr(inner, "model") and hasattr(inner.model, "embed_tokens"):
+                return inner.model.embed_tokens
+        return llm.get_input_embeddings()
+
     def forward(self, images, input_ids, attention_mask, labels=None):
         """
         Args:
@@ -133,13 +147,7 @@ class ShoulderSFTModel(nn.Module):
         visual_tokens = self.projector(branch_feats)  # [B, 3, H]
 
         # 2. Get text embeddings
-        # Access the base model's embed_tokens
-        if hasattr(self.llm, "model"):
-            embed_fn = self.llm.model.embed_tokens
-        elif hasattr(self.llm, "base_model"):
-            embed_fn = self.llm.base_model.model.embed_tokens
-        else:
-            embed_fn = self.llm.get_input_embeddings()
+        embed_fn = self._get_embed_fn()
 
         text_embeds = embed_fn(input_ids)  # [B, L, H]
 
@@ -172,12 +180,7 @@ class ShoulderSFTModel(nn.Module):
         branch_feats = self._extract_branch_features(images)
         visual_tokens = self.projector(branch_feats)
 
-        if hasattr(self.llm, "model"):
-            embed_fn = self.llm.model.embed_tokens
-        elif hasattr(self.llm, "base_model"):
-            embed_fn = self.llm.base_model.model.embed_tokens
-        else:
-            embed_fn = self.llm.get_input_embeddings()
+        embed_fn = self._get_embed_fn()
 
         text_embeds = embed_fn(input_ids)
         inputs_embeds = self._merge_visual_tokens(
@@ -253,11 +256,23 @@ def load_config(path):
 # ── Training ─────────────────────────────────────────────────────────────
 
 def train_epoch(model, loader, optimizer, scheduler, device, epoch,
-                max_grad_norm=1.0):
-    """Train for one epoch."""
+                max_grad_norm=1.0, grad_accum_steps=1):
+    """Train for one epoch with gradient accumulation."""
     model.train()
+    # Keep frozen MRI-CV in eval mode to avoid BatchNorm issues with bs=1
+    if model.mri_cv_frozen:
+        model.mri_cv.eval()
+    else:
+        # Stage 2: MRI-CV partially unfrozen, but still set eval for
+        # frozen sub-modules to keep BatchNorm stable
+        model.mri_cv.eval()
+        # Then set only unfrozen sub-modules back to train
+        for name, module in model.mri_cv.named_modules():
+            if any(p.requires_grad for p in module.parameters(recurse=False)):
+                module.train()
     total_loss = 0.0
     num_steps = 0
+    accum_loss = 0.0
 
     try:
         from tqdm import tqdm
@@ -265,32 +280,37 @@ def train_epoch(model, loader, optimizer, scheduler, device, epoch,
     except ImportError:
         iter_ = loader
 
-    for batch in iter_:
+    optimizer.zero_grad()
+
+    for batch_idx, batch in enumerate(iter_):
         images = batch["image"].to(device)
         input_ids = batch["input_ids"].to(device)
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
 
         outputs = model(images, input_ids, attention_mask, labels=labels)
-        loss = outputs.loss
+        loss = outputs.loss / grad_accum_steps
 
         loss.backward()
+        accum_loss += loss.item()
 
-        # Gradient clipping
-        if max_grad_norm > 0:
-            torch.nn.utils.clip_grad_norm_(
-                [p for p in model.parameters() if p.requires_grad],
-                max_grad_norm)
+        if (batch_idx + 1) % grad_accum_steps == 0 or (batch_idx + 1) == len(loader):
+            # Gradient clipping
+            if max_grad_norm > 0:
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in model.parameters() if p.requires_grad],
+                    max_grad_norm)
 
-        optimizer.step()
-        scheduler.step()
-        optimizer.zero_grad()
+            optimizer.step()
+            scheduler.step()
+            optimizer.zero_grad()
 
-        total_loss += loss.item()
-        num_steps += 1
+            total_loss += accum_loss
+            num_steps += 1
+            accum_loss = 0.0
 
         if hasattr(iter_, "set_postfix"):
-            iter_.set_postfix(loss="%.4f" % loss.item())
+            iter_.set_postfix(loss="%.4f" % (loss.item() * grad_accum_steps))
 
     avg_loss = total_loss / max(num_steps, 1)
     return {"loss": avg_loss, "steps": num_steps}
@@ -488,6 +508,11 @@ def train(config, args):
         num_visual_tokens=num_visual_tokens,
     )
 
+    # Limit samples for smoke test
+    if args.max_samples > 0 and len(train_dataset.samples) > args.max_samples:
+        train_dataset.samples = train_dataset.samples[:args.max_samples]
+        print("Smoke test: limited to %d training samples" % args.max_samples)
+
     val_jsonl = data_cfg.get("val_jsonl", [])
     val_dataset = None
     if val_jsonl:
@@ -499,6 +524,8 @@ def train(config, args):
             max_length=data_cfg.get("max_seq_length", 2048),
             num_visual_tokens=num_visual_tokens,
         )
+        if args.max_samples > 0 and len(val_dataset.samples) > args.max_samples:
+            val_dataset.samples = val_dataset.samples[:args.max_samples]
 
     train_cfg = config["training"]
     collate = partial(sft_collate_fn,
@@ -558,7 +585,9 @@ def train(config, args):
     )
 
     # Scheduler
-    total_steps = len(train_loader) * train_cfg["max_epochs"]
+    grad_accum = train_cfg.get("gradient_accumulation_steps", 1)
+    steps_per_epoch = (len(train_loader) + grad_accum - 1) // grad_accum
+    total_steps = steps_per_epoch * train_cfg["max_epochs"]
     warmup_steps = int(total_steps * train_cfg.get("warmup_ratio", 0.03))
 
     from transformers import get_cosine_schedule_with_warmup
@@ -571,13 +600,17 @@ def train(config, args):
     # ── Training loop ──
     best_val_loss = float("inf")
     jsonl_path = os.path.join(output_dir, "metrics_epoch.jsonl")
+    grad_accum_steps = train_cfg.get("gradient_accumulation_steps", 1)
+    print("Gradient accumulation steps: %d (effective batch = %d)" % (
+        grad_accum_steps, train_cfg["batch_size"] * grad_accum_steps))
 
     for epoch in range(start_epoch, train_cfg["max_epochs"]):
         print("\n[Epoch %d/%d]" % (epoch + 1, train_cfg["max_epochs"]))
 
         train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch,
-            max_grad_norm=train_cfg.get("max_grad_norm", 1.0))
+            max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
+            grad_accum_steps=grad_accum_steps)
 
         print("  Train loss: %.4f (steps: %d)" % (
             train_metrics["loss"], train_metrics["steps"]))
@@ -669,6 +702,8 @@ def main():
                         help="Path to checkpoint to resume from")
     parser.add_argument("--output", "-o", default=None,
                         help="Override output directory")
+    parser.add_argument("--max_samples", type=int, default=0,
+                        help="Limit training samples (0=all, for smoke test)")
     args = parser.parse_args()
 
     config = load_config(args.config)

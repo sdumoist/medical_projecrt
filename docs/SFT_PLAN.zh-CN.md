@@ -57,7 +57,7 @@ MRI [B, 5, 1, Z, H, W]
 | scheduler | cosine, warmup 3% |
 | max_epochs | 5 |
 | precision | bf16 |
-| 并行策略 | DeepSpeed ZeRO-2 |
+| 并行策略 | 当前 MVP: torchrun (DDP)；后续: DeepSpeed ZeRO-2 |
 | gradient_checkpointing | LLM only |
 
 ### 任务优先级
@@ -133,3 +133,18 @@ MRI [B, 5, 1, Z, H, W]
 | Stage 1 冒烟 | 1 GPU + 10 条样本，loss 正常下降 |
 | Stage 1 完整 | 8 GPU 训练，label_binary + diagnosis_chain，val JSON parse > 80% |
 | Stage 2 | 部分解冻，验证指标不退化 |
+
+---
+
+## 当前实现状态
+
+### 已实现
+- `torchrun` 多 GPU 训练（标准 PyTorch DDP）
+- 梯度累积（`gradient_accumulation_steps` 已在训练循环中实现）
+- bf16 混合精度
+- Gradient checkpointing（LLM）
+
+### 尚未实现（后续扩展）
+- **DeepSpeed ZeRO-2**：当前版本使用 torchrun DDP。若单卡显存不足或需要更大 batch size，后续接入 DeepSpeed
+- **Differentiable auxiliary heads**：Stage 2 联合 loss 的前置条件
+- **Stage 3 训练代码**：仅有配置占位
