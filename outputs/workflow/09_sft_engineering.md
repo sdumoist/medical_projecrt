@@ -100,6 +100,12 @@ MRI [B,5,1,Z,H,W]
 - **BatchNorm bs=1 报错**：冻结 MRI-CV 强制 `eval()` 模式
 - **PeftModel embed_tokens 路径**：新增 `_get_embed_fn()` 方法适配 LoRA 包装后的模型结构
 
+### 4. validate() generate() 输出切分错误（二次审查发现）
+- **问题**：`model.generate()` 使用 `inputs_embeds` 路线，但未传 `input_ids`。此时 HuggingFace `generate()` 返回的序列**仅包含新生成的 token**（不含 prompt），但 `validate()` 仍按 `gen_ids[0][plen:]` 切分，导致生成结果被错误截断
+- **根因**：`transformers.GenerationMixin` 在仅接收 `inputs_embeds` 时，内部 `input_ids` 初始化为空张量 `(B, 0)`，最终返回的序列长度 = 新生成 token 数
+- **修复**：`generate()` 方法同时传递 `input_ids` 和 `inputs_embeds`（前者用于构建返回序列，后者用于首次 forward pass）；`validate()` 增加长度检查的 fallback 逻辑
+- **影响文件**：`sft/train_sft.py`
+
 ---
 
 ## 五、冒烟测试结果（10 samples × 2 epochs）

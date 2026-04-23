@@ -186,7 +186,11 @@ class ShoulderSFTModel(nn.Module):
         inputs_embeds = self._merge_visual_tokens(
             text_embeds, visual_tokens.to(text_embeds.dtype))
 
+        # Pass input_ids alongside inputs_embeds so the returned sequence
+        # includes the prompt token IDs (inputs_embeds is used for the
+        # first forward pass, input_ids seeds the output sequence).
         return self.llm.generate(
+            input_ids=input_ids,
             inputs_embeds=inputs_embeds,
             attention_mask=attention_mask,
             **gen_kwargs,
@@ -361,8 +365,16 @@ def validate(model, loader, tokenizer, device, max_new_tokens=512):
                         do_sample=False,
                         temperature=1.0,
                     )
-                    gen_text = tokenizer.decode(
-                        gen_ids[0][plen:], skip_special_tokens=True)
+                    # gen_ids includes prompt (input_ids passed to generate).
+                    # Slice off prompt to get only generated tokens.
+                    gen_len = gen_ids.shape[1]
+                    if gen_len > plen:
+                        gen_text = tokenizer.decode(
+                            gen_ids[0][plen:], skip_special_tokens=True)
+                    else:
+                        # Fallback: if generate returned only new tokens
+                        gen_text = tokenizer.decode(
+                            gen_ids[0], skip_special_tokens=True)
                 except Exception:
                     gen_text = ""
 
