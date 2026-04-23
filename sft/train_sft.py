@@ -5,16 +5,21 @@ SFT training script for shoulder MRI + Qwen2.5-7B.
 
 Supports:
   - Stage 1: Frozen MRI-CV, train VisualProjector + Qwen LoRA
-  - Stage 2: Partially unfrozen MRI-CV, same loss (LM only)
+  - Stage 2: Partially unfrozen MRI-CV, joint LM + key-slice loss
 
 Usage:
     # Stage 1 (single GPU smoke test)
     CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python sft/train_sft.py \
-        --config configs/sft_stage1_frozen.yaml
+        --config configs/sft_stage1_grounded.yaml --max_samples 10
 
-    # Stage 1 (multi-GPU with DeepSpeed)
+    # Stage 1 (multi-GPU with torchrun DDP)
     torchrun --nproc_per_node=8 sft/train_sft.py \
-        --config configs/sft_stage1_frozen.yaml
+        --config configs/sft_stage1_grounded.yaml
+
+    # Stage 2 (resume from Stage 1 best)
+    torchrun --nproc_per_node=8 sft/train_sft.py \
+        --config configs/sft_stage2_grounded.yaml \
+        --resume outputs/sft_experiments/sft_stage1_grounded/best_checkpoint.pt
 """
 from __future__ import print_function
 
@@ -48,24 +53,37 @@ class VisualProjector(nn.Module):
 
     Handles both global branch tokens (3) and local key-slice tokens (7).
     The same shared MLP is applied to all tokens independently.
+
+    Learnable slot embeddings are added to the projected tokens to encode
+    the identity of each visual slot:
+        0: SAG_GLOBAL, 1: COR_GLOBAL, 2: AXI_GLOBAL,
+        3: SST_LOCAL, 4: IST_LOCAL, 5: SSC_LOCAL, 6: LHBT_LOCAL,
+        7: IGHL_LOCAL, 8: RIPI_LOCAL, 9: GHOA_LOCAL
     """
 
-    def __init__(self, cv_dim, llm_dim):
+    def __init__(self, cv_dim, llm_dim, num_slots=10):
         super().__init__()
         self.proj = nn.Sequential(
             nn.Linear(cv_dim, llm_dim),
             nn.GELU(),
             nn.Linear(llm_dim, llm_dim),
         )
+        # Learnable slot identity embeddings [N, H]
+        self.slot_embed = nn.Embedding(num_slots, llm_dim)
 
     def forward(self, visual_tokens):
         """
         Args:
             visual_tokens: [B, N, C] where N = num_visual_tokens (3 or 10)
         Returns:
-            projected: [B, N, H] in LLM dim
+            projected: [B, N, H] in LLM dim, with slot identity added
         """
-        return self.proj(visual_tokens)
+        B, N, _ = visual_tokens.shape
+        projected = self.proj(visual_tokens)  # [B, N, H]
+        # Add slot identity embeddings (broadcast over batch)
+        slot_ids = torch.arange(N, device=visual_tokens.device)
+        projected = projected + self.slot_embed(slot_ids).unsqueeze(0)
+        return projected
 
 
 # ── SFT Model ────────────────────────────────────────────────────────────
@@ -315,20 +333,20 @@ def train_epoch(model, loader, optimizer, scheduler, device, epoch,
 
         # Optional key-slice loss (Stage 2: L_keyslice from grounding heads)
         if keyslice_alpha > 0 and 'slice_logits' in cv_out:
-            ks_gt = batch.get("key_slices")  # [B, 7] or None
+            ks_gt = batch.get("key_slices")          # [B, 7] long, -1 = unavailable
+            d_mask = batch.get("disease_mask")        # [B, 7] float, 1.0 = valid
             if ks_gt is not None:
                 import torch.nn.functional as F
                 slice_logits = cv_out['slice_logits']  # [B, 7, D']
                 B_ks, _, D_ks = slice_logits.shape
-                ks_gt = ks_gt.to(device).float()
+                ks_gt = ks_gt.to(device)
                 input_Z = images.shape[3]
-                ks_scaled = (ks_gt * D_ks / input_Z).long().clamp(0, D_ks - 1)
-                label_mask = batch.get("mask")
-                if label_mask is not None:
-                    label_mask = label_mask.to(device)
-                    valid = (ks_gt >= 0) & (label_mask > 0)
-                else:
-                    valid = ks_gt >= 0
+                # Rescale GT key_slice index to D' resolution
+                ks_scaled = (ks_gt.float() * D_ks / input_Z).long().clamp(0, D_ks - 1)
+                # Valid: ks_gt >= 0 AND disease label is valid
+                valid = ks_gt >= 0
+                if d_mask is not None:
+                    valid = valid & (d_mask.to(device) > 0)
                 if valid.any() and D_ks > 1:
                     ks_loss = F.cross_entropy(
                         slice_logits[valid], ks_scaled[valid])
@@ -522,7 +540,8 @@ def train(config, args):
     llm.print_trainable_parameters()
 
     # ── Assemble SFT model ──
-    projector = VisualProjector(cv_dim=feat_dim, llm_dim=llm_dim)
+    projector = VisualProjector(
+        cv_dim=feat_dim, llm_dim=llm_dim, num_slots=num_visual_tokens)
     model = ShoulderSFTModel(mri_cv, projector, llm, num_visual_tokens)
     model = model.to(device)
 

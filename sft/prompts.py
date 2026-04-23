@@ -13,6 +13,14 @@ DISEASE_LIST_ZH = (
     "RIPI（肩袖间隙异常）、GHOA（盂肱关节退行性变）"
 )
 
+# Visual slot description appended to system prompts for grounded tasks
+VISUAL_SLOT_DESC = (
+    "你将接收到10个视觉特征槽位，前3个是全局特征"
+    "（矢状位、冠状位、轴位），后7个是病种专属局部特征"
+    "（SST、IST、SSC、LHBT、IGHL、RIPI、GHOA），"
+    "分别对应各病种关键层面的影像信息。"
+)
+
 TASK_MESSAGES = {
     "label_binary": [
         {
@@ -20,6 +28,7 @@ TASK_MESSAGES = {
             "content": (
                 "你是一位专业的肩关节MRI影像诊断AI助手。"
                 "你将根据MRI影像特征，对7种肩关节疾病进行结构化诊断。"
+                + VISUAL_SLOT_DESC +
                 "请严格以JSON格式输出。"
             ),
         },
@@ -40,6 +49,7 @@ TASK_MESSAGES = {
                 "你将根据MRI影像特征，输出完整的结构化诊断链，"
                 "包括病种标签、影像学证据、锚定序列、关键层面、"
                 "结构化影像学所见和结构化影像学印象。"
+                + VISUAL_SLOT_DESC +
                 "请严格以JSON格式输出。"
             ),
         },

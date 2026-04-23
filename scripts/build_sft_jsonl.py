@@ -327,7 +327,7 @@ def build_sft_jsonl(args):
         "field_completeness": {
             "evidence_nonempty": 0,
             "key_slice_available": 0,
-            "roi_available": 0,
+            "roi_available": 0,  # statistics only; roi_box not in v1 output
             "findings_nonempty": 0,
             "impression_nonempty": 0,
             "total_eligible": 0,

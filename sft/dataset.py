@@ -11,6 +11,8 @@ Each sample returns:
     - attention_mask: [L]
     - task_type: str
     - exam_id: str
+    - key_slices: [7] int tensor (from cache_loc .pt, -1 = unavailable)
+    - disease_mask: [7] float tensor (1.0 = valid label, 0.0 = masked)
 """
 import os
 import json
@@ -19,6 +21,7 @@ import numpy as np
 from torch.utils.data import Dataset
 
 from sft.prompts import get_task_messages
+from utils.constants import DISEASES, NUM_DISEASES
 
 
 class SFTDataset(Dataset):
@@ -99,15 +102,21 @@ class SFTDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
-    def _load_image(self, exam_id):
-        """Load MRI image tensor from cache .pt file.
+    def _load_cache(self, exam_id):
+        """Load MRI image, key_slices, and disease_mask from cache .pt file.
 
-        Returns [5, 1, Z, H, W] float tensor, Z padded/cropped to target_z.
+        Returns:
+            image: [5, 1, Z, H, W] float tensor, Z padded/cropped to target_z
+            key_slices: [7] long tensor (-1 = unavailable)
+            disease_mask: [7] float tensor (1.0 = valid label, 0.0 = masked)
         """
+        default_ks = torch.full((NUM_DISEASES,), -1, dtype=torch.long)
+        default_mask = torch.zeros(NUM_DISEASES, dtype=torch.float)
+
         cache_path = self.cache_lookup.get(exam_id)
         if not cache_path or not os.path.exists(cache_path):
-            # Return zero tensor as fallback
-            return torch.zeros(5, 1, self.target_z, 448, 448)
+            return (torch.zeros(5, 1, self.target_z, 448, 448),
+                    default_ks, default_mask)
 
         record = torch.load(cache_path, map_location="cpu", weights_only=False)
         image = record["image"]  # [5, Z, H, W]
@@ -121,8 +130,40 @@ class SFTDataset(Dataset):
             image = image[:, :self.target_z]
 
         # Add channel dim: [5, Z, H, W] -> [5, 1, Z, H, W]
-        image = image.unsqueeze(1)
-        return image.float()
+        image = image.unsqueeze(1).float()
+
+        # Extract key_slices [7] from cache_loc record
+        key_slices = default_ks.clone()
+        if "key_slices" in record:
+            raw_ks = record["key_slices"]
+            if isinstance(raw_ks, torch.Tensor):
+                # Tensor shape [7] or dict-like
+                key_slices = raw_ks.long()
+            elif isinstance(raw_ks, dict):
+                for i, d in enumerate(DISEASES):
+                    v = raw_ks.get(d)
+                    if v is not None and v >= 0:
+                        key_slices[i] = int(v)
+            elif isinstance(raw_ks, (list, np.ndarray)):
+                for i, v in enumerate(raw_ks):
+                    if v is not None and v >= 0:
+                        key_slices[i] = int(v)
+
+        # Extract disease_mask [7] (label validity mask)
+        disease_mask = default_mask.clone()
+        if "mask" in record:
+            raw_mask = record["mask"]
+            if isinstance(raw_mask, torch.Tensor):
+                disease_mask = raw_mask.float()
+            elif isinstance(raw_mask, (list, np.ndarray)):
+                disease_mask = torch.tensor(raw_mask, dtype=torch.float)
+        elif "labels" in record:
+            # Infer mask from labels: valid if label in {0, 1, 2}
+            raw_labels = record["labels"]
+            if isinstance(raw_labels, torch.Tensor):
+                disease_mask = ((raw_labels >= 0) & (raw_labels <= 2)).float()
+
+        return image, key_slices, disease_mask
 
     def _tokenize_sample(self, sample):
         """Tokenize instruction + output, create labels.
@@ -181,8 +222,8 @@ class SFTDataset(Dataset):
         exam_id = sample["exam_id"]
         task_type = sample["task_type"]
 
-        # Load image
-        image = self._load_image(exam_id)
+        # Load image + grounding supervision signals
+        image, key_slices, disease_mask = self._load_cache(exam_id)
 
         # Tokenize
         tok = self._tokenize_sample(sample)
@@ -196,6 +237,8 @@ class SFTDataset(Dataset):
             "exam_id": exam_id,
             "prompt_len": tok["prompt_len"],
             "output_text": sample["output"],
+            "key_slices": key_slices,
+            "disease_mask": disease_mask,
         }
 
 
@@ -252,4 +295,6 @@ def sft_collate_fn(batch, pad_token_id=0, num_visual_tokens=3):
         "exam_ids": [b["exam_id"] for b in batch],
         "prompt_lens": [b["prompt_len"] for b in batch],
         "output_texts": [b["output_text"] for b in batch],
+        "key_slices": torch.stack([b["key_slices"] for b in batch]),   # [B, 7]
+        "disease_mask": torch.stack([b["disease_mask"] for b in batch]),  # [B, 7]
     }
