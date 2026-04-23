@@ -1,0 +1,67 @@
+# Grounded SFT Stage 1: Frozen MRI-CV backbone, train Projector + Qwen LoRA
+# 10 visual tokens: 3 global (sag/cor/axi) + 7 local (disease-aware key-slice)
+# First version: only label_binary + diagnosis_chain tasks
+
+stage: 1
+
+# ── MRI-CV backbone ──
+mri_cv:
+  encoder: "swin3d_tiny"
+  checkpoint_path: "outputs/experiments/g3_grounded_swin_binary/best_model.pt"
+  use_localizer: true
+  freeze: true
+
+# ── Visual Projector ──
+projector:
+  num_visual_tokens: 10   # 3 global + 7 local
+
+# ── LLM ──
+llm:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  model_path: "/mnt/cfs_algo_bj/models/opensource_model/Qwen/Qwen2.5-7B-Instruct"
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  lora_dropout: 0.05
+  torch_dtype: "bfloat16"
+  use_flash_attn: true
+  gradient_checkpointing: true
+
+# ── Data ──
+data:
+  cache_root: "outputs/cache_loc"
+  cache_mode: "loc"
+  cache_index: "outputs/cache_loc/cache_loc_index.csv"
+  max_seq_length: 2048
+
+  # First version: only label_binary + diagnosis_chain
+  train_jsonl:
+    - "outputs/sft_data/sft_label_binary_train.jsonl"
+    - "outputs/sft_data/sft_diagnosis_chain_train.jsonl"
+  val_jsonl:
+    - "outputs/sft_data/sft_label_binary_val.jsonl"
+    - "outputs/sft_data/sft_diagnosis_chain_val.jsonl"
+
+# ── Training ──
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  num_workers: 4
+  max_epochs: 5
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  seed: 42
+  # Stage 1: no key-slice loss (backbone frozen, grounding already trained)
+  keyslice_alpha: 0.0
+
+# ── Validation ──
+validation:
+  val_interval: 1
+  generation_max_length: 512
+
+# ── Output ──
+output:
+  exp_name: "sft_stage1_grounded"
+  output_dir: "outputs/sft_experiments"

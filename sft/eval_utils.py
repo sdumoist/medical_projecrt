@@ -8,17 +8,7 @@ import json
 import re
 from collections import defaultdict
 
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
-
-ANCHOR_SEQ_GT = {
-    "SST": "coronal_PD",
-    "IST": "axial_PD",
-    "SSC": "axial_PD",
-    "LHBT": "coronal_PD",
-    "IGHL": "coronal_PD",
-    "RIPI": "sagittal_PD",
-    "GHOA": "coronal_PD",
-}
+from utils.constants import DISEASES, DISEASE_ANCHOR_SEQ
 
 
 # ── JSON Parsing ─────────────────────────────────────────────────────────
@@ -227,7 +217,7 @@ def eval_diagnosis_chain(pred_output, gt_output):
     anch_correct = 0
     anch_total = 0
     for d in DISEASES:
-        gt_a = ANCHOR_SEQ_GT.get(d, "")
+        gt_a = DISEASE_ANCHOR_SEQ.get(d, "")
         pred_a = pred_anch.get(d, "")
         if gt_a:
             anch_total += 1
@@ -254,13 +244,30 @@ def eval_diagnosis_chain(pred_output, gt_output):
     result["key_slice_exact"] = ks_exact / ks_total if ks_total > 0 else 0
     result["key_slice_pm1"] = ks_pm1 / ks_total if ks_total > 0 else 0
 
-    # Field completeness
-    fields_present = 0
-    fields_expected = 5  # labels, evidence, anchor_sequence, key_slice, roi_box
-    for field in ["labels", "evidence", "anchor_sequence", "key_slice", "roi_box"]:
-        if field in pred_output and pred_output[field]:
-            fields_present += 1
-    result["field_completeness"] = fields_present / fields_expected
+    # Core chain completeness: labels, evidence, anchor_sequence, key_slice
+    core_fields = ["labels", "evidence", "anchor_sequence", "key_slice"]
+    core_present = sum(
+        1 for f in core_fields if f in pred_output and pred_output[f])
+    result["core_chain_completeness"] = core_present / len(core_fields)
+
+    # Report completeness: structured_findings, structured_impression
+    report_fields = ["structured_findings", "structured_impression"]
+    report_present = sum(
+        1 for f in report_fields if f in pred_output and pred_output[f])
+    result["report_completeness"] = report_present / len(report_fields)
+
+    # If findings/impression are present, compute fuzzy metrics
+    pred_findings = pred_output.get("structured_findings", [])
+    gt_findings = gt_output.get("structured_findings", [])
+    if gt_findings:
+        fm = fuzzy_sentence_match(pred_findings, gt_findings)
+        result["findings_f1"] = fm["f1"]
+
+    pred_impression = pred_output.get("structured_impression", [])
+    gt_impression = gt_output.get("structured_impression", [])
+    if gt_impression:
+        im = fuzzy_sentence_match(pred_impression, gt_impression)
+        result["impression_f1"] = im["f1"]
 
     return result
 

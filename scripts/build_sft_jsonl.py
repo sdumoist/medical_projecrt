@@ -30,7 +30,7 @@ PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
     sys.path.insert(0, PROJECT_ROOT)
 
-from utils.io import DISEASES, DISEASE_ANCHOR_SEQ
+from utils.constants import DISEASES, DISEASE_ANCHOR_SEQ
 from sft.prompts import build_prompt_plain, TASK_TYPES
 
 
@@ -140,9 +140,13 @@ def build_label_binary_output(case_data):
 def build_diagnosis_chain_output(case_data, loc_data=None):
     """Build output string for diagnosis_chain task.
 
+    Grounded v1: includes labels, evidence, anchor_sequence, key_slice,
+    structured_findings, and structured_impression.
+    roi_box removed (deferred to v2).
+
     Args:
         case_data: dict from case JSON
-        loc_data: dict with 'key_slices' and 'roi_boxes' from cache_loc .pt
+        loc_data: dict with 'key_slices' from cache_loc .pt
     """
     labels = case_data.get("labels", {})
     evidence_text = case_data.get("evidence_text", {})
@@ -153,7 +157,8 @@ def build_diagnosis_chain_output(case_data, loc_data=None):
         "evidence": {},
         "anchor_sequence": {},
         "key_slice": {},
-        "roi_box": {},
+        "structured_findings": case_data.get("structured_findings", []),
+        "structured_impression": case_data.get("structured_impression", []),
     }
 
     for d in DISEASES:
@@ -167,17 +172,13 @@ def build_diagnosis_chain_output(case_data, loc_data=None):
 
         result["anchor_sequence"][d] = DISEASE_ANCHOR_SEQ.get(d, "unknown")
 
-        # key_slice and roi_box from cache_loc
+        # key_slice from cache_loc
         if loc_data:
             ks = loc_data.get("key_slices", {})
-            rb = loc_data.get("roi_boxes", {})
             ks_val = ks.get(d)
-            rb_val = rb.get(d)
             result["key_slice"][d] = ks_val if ks_val is not None and ks_val >= 0 else None
-            result["roi_box"][d] = rb_val if rb_val else None
         else:
             result["key_slice"][d] = None
-            result["roi_box"][d] = None
 
     return json.dumps(result, ensure_ascii=False)
 

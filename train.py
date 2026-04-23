@@ -216,6 +216,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root):
         shuffle=True,
         num_workers=num_workers,
         pin_memory=True,
+        drop_last=True,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -253,7 +254,9 @@ def compute_total_loss(output, labels, mask, criterion, branch_alpha,
         'axi': axi_loss.item(),
     }
 
-    # Localizer loss (key-slice prediction)
+    # Localizer loss (disease-specific key-slice prediction)
+    # slice_logits: [B, 7, D'] from DiseaseSpecificSliceHeads
+    # Each disease's logits come from its anchor branch's slice features
     if use_localizer and localizer_alpha > 0 and 'slice_logits' in output:
         key_slices = batch.get("key_slices", None)  # [B, 7] in input Z-space
         if key_slices is not None:

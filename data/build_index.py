@@ -12,9 +12,7 @@ from utils.io import (
     SEQUENCE_TYPES, list_exam_ids,
     get_image_path, get_json_path, load_json_label
 )
-
-
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
+from utils.constants import DISEASES
 
 # 直接映射: 病种 -> nnUNet mask 文件夹
 DISEASE_TO_MASK_FOLDER = {

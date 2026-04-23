@@ -2,7 +2,15 @@
 """更新 metadata CSV 中的 mask 路径，加入新推理的 no_mask_pred"""
 
 import os
+import sys
 import pandas as pd
+
+# ---- project imports -----------------------------------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from utils.constants import DISEASES
 
 NNUNET_ROOT = "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
 METADATA_FILE = "/mnt/cfs_algo_bj/models/experiments/lirunze/code/project/outputs/metadata/metadata_master.csv"
@@ -17,8 +25,6 @@ DISEASE_TO_MASK_FOLDER = {
     "RIPI": "Dataset009_gongretou_no_mask_pred",
     "GHOA": "Dataset010_yenang_2_no_mask_pred",
 }
-
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
 
 
 def get_new_mask_path(exam_id, disease):

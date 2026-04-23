@@ -44,10 +44,10 @@ from sft.eval_utils import evaluate_sample, aggregate_metrics, try_parse_json
 # ── Visual Projector ─────────────────────────────────────────────────────
 
 class VisualProjector(nn.Module):
-    """Project branch features [B, 3, C] to LLM embedding space [B, 3, H].
+    """Project visual features [B, N, C] to LLM embedding space [B, N, H].
 
-    Each branch token passes through the same 2-layer MLP independently,
-    preserving the sag/cor/axi structure.
+    Handles both global branch tokens (3) and local key-slice tokens (7).
+    The same shared MLP is applied to all tokens independently.
     """
 
     def __init__(self, cv_dim, llm_dim):
@@ -58,22 +58,27 @@ class VisualProjector(nn.Module):
             nn.Linear(llm_dim, llm_dim),
         )
 
-    def forward(self, branch_tokens):
+    def forward(self, visual_tokens):
         """
         Args:
-            branch_tokens: [B, 3, C] stacked branch features
+            visual_tokens: [B, N, C] where N = num_visual_tokens (3 or 10)
         Returns:
-            visual_tokens: [B, 3, H] projected to LLM dim
+            projected: [B, N, H] in LLM dim
         """
-        return self.proj(branch_tokens)
+        return self.proj(visual_tokens)
 
 
 # ── SFT Model ────────────────────────────────────────────────────────────
 
 class ShoulderSFTModel(nn.Module):
-    """Full SFT model: MRI-CV → Projector → Qwen2.5-7B."""
+    """Full SFT model: MRI-CV → Projector → Qwen2.5-7B.
 
-    def __init__(self, mri_cv, projector, llm, num_visual_tokens=3):
+    When MRI-CV has use_localizer=True, produces 10 visual tokens:
+        [sag_feat, cor_feat, axi_feat] + [SST, IST, SSC, LHBT, IGHL, RIPI, GHOA]
+    Otherwise falls back to 3 global tokens only.
+    """
+
+    def __init__(self, mri_cv, projector, llm, num_visual_tokens=10):
         super().__init__()
         self.mri_cv = mri_cv
         self.projector = projector
@@ -81,26 +86,34 @@ class ShoulderSFTModel(nn.Module):
         self.num_visual_tokens = num_visual_tokens
         self.mri_cv_frozen = True
 
-    def _extract_branch_features(self, images):
-        """Extract branch features from MRI-CV.
+    def _extract_visual_tokens(self, images):
+        """Extract visual tokens from MRI-CV.
 
         Args:
             images: [B, 5, 1, Z, H, W]
         Returns:
-            [B, 3, C] stacked branch features
+            visual_feats: [B, N, C] where N = num_visual_tokens
+            cv_out: full MRI-CV output dict (for slice_logits access in Stage 2)
         """
         ctx = torch.no_grad() if self.mri_cv_frozen else torch.enable_grad()
         with ctx:
             cv_out = self.mri_cv(images)
 
-        # Stack branch features: [B, C] x 3 -> [B, 3, C]
-        branch_feats = torch.stack([
+        # 3 global branch tokens
+        global_tokens = torch.stack([
             cv_out["sag_feat"],
             cv_out["cor_feat"],
             cv_out["axi_feat"],
-        ], dim=1)
+        ], dim=1)  # [B, 3, C]
 
-        return branch_feats
+        # If localizer is enabled, append 7 disease-aware local tokens
+        if "local_tokens" in cv_out:
+            local_tokens = cv_out["local_tokens"]  # [B, 7, C]
+            visual_feats = torch.cat([global_tokens, local_tokens], dim=1)  # [B, 10, C]
+        else:
+            visual_feats = global_tokens  # [B, 3, C]
+
+        return visual_feats, cv_out
 
     def _merge_visual_tokens(self, text_embeds, visual_tokens):
         """Replace first N visual token positions with projected embeddings.
@@ -140,11 +153,12 @@ class ShoulderSFTModel(nn.Module):
             labels: [B, L] (-100 for non-output positions)
 
         Returns:
-            dict with 'loss' and 'logits'
+            outputs: LLM outputs with .loss and .logits
+            cv_out: MRI-CV output dict (contains slice_logits for Stage 2 loss)
         """
         # 1. Extract and project visual features
-        branch_feats = self._extract_branch_features(images)
-        visual_tokens = self.projector(branch_feats)  # [B, 3, H]
+        visual_feats, cv_out = self._extract_visual_tokens(images)
+        visual_tokens = self.projector(visual_feats)  # [B, N, H]
 
         # 2. Get text embeddings
         embed_fn = self._get_embed_fn()
@@ -162,7 +176,7 @@ class ShoulderSFTModel(nn.Module):
             labels=labels,
         )
 
-        return outputs
+        return outputs, cv_out
 
     @torch.no_grad()
     def generate(self, images, input_ids, attention_mask, **gen_kwargs):
@@ -177,8 +191,8 @@ class ShoulderSFTModel(nn.Module):
         Returns:
             generated_ids: [B, L_out]
         """
-        branch_feats = self._extract_branch_features(images)
-        visual_tokens = self.projector(branch_feats)
+        visual_feats, _ = self._extract_visual_tokens(images)
+        visual_tokens = self.projector(visual_feats)
 
         embed_fn = self._get_embed_fn()
 
@@ -260,8 +274,12 @@ def load_config(path):
 # ── Training ─────────────────────────────────────────────────────────────
 
 def train_epoch(model, loader, optimizer, scheduler, device, epoch,
-                max_grad_norm=1.0, grad_accum_steps=1):
-    """Train for one epoch with gradient accumulation."""
+                max_grad_norm=1.0, grad_accum_steps=1, keyslice_alpha=0.0):
+    """Train for one epoch with gradient accumulation.
+
+    Args:
+        keyslice_alpha: weight for L_keyslice loss (Stage 2). 0 = disabled.
+    """
     model.train()
     # Keep frozen MRI-CV in eval mode to avoid BatchNorm issues with bs=1
     if model.mri_cv_frozen:
@@ -292,8 +310,29 @@ def train_epoch(model, loader, optimizer, scheduler, device, epoch,
         attention_mask = batch["attention_mask"].to(device)
         labels = batch["labels"].to(device)
 
-        outputs = model(images, input_ids, attention_mask, labels=labels)
+        outputs, cv_out = model(images, input_ids, attention_mask, labels=labels)
         loss = outputs.loss / grad_accum_steps
+
+        # Optional key-slice loss (Stage 2: L_keyslice from grounding heads)
+        if keyslice_alpha > 0 and 'slice_logits' in cv_out:
+            ks_gt = batch.get("key_slices")  # [B, 7] or None
+            if ks_gt is not None:
+                import torch.nn.functional as F
+                slice_logits = cv_out['slice_logits']  # [B, 7, D']
+                B_ks, _, D_ks = slice_logits.shape
+                ks_gt = ks_gt.to(device).float()
+                input_Z = images.shape[3]
+                ks_scaled = (ks_gt * D_ks / input_Z).long().clamp(0, D_ks - 1)
+                label_mask = batch.get("mask")
+                if label_mask is not None:
+                    label_mask = label_mask.to(device)
+                    valid = (ks_gt >= 0) & (label_mask > 0)
+                else:
+                    valid = ks_gt >= 0
+                if valid.any() and D_ks > 1:
+                    ks_loss = F.cross_entropy(
+                        slice_logits[valid], ks_scaled[valid])
+                    loss = loss + keyslice_alpha * ks_loss / grad_accum_steps
 
         loss.backward()
         accum_loss += loss.item()
@@ -342,7 +381,7 @@ def validate(model, loader, tokenizer, device, max_new_tokens=512):
         labels = batch["labels"].to(device)
 
         # Compute loss
-        outputs = model(images, input_ids, attention_mask, labels=labels)
+        outputs, cv_out = model(images, input_ids, attention_mask, labels=labels)
         total_loss += outputs.loss.item()
         num_steps += 1
 
@@ -447,7 +486,7 @@ def train(config, args):
     # ── Build projector ──
     feat_dim = mri_cv.encoders["axial_PD"].num_features
     proj_cfg = config.get("projector", {})
-    num_visual_tokens = proj_cfg.get("num_visual_tokens", 3)
+    num_visual_tokens = proj_cfg.get("num_visual_tokens", 10)
 
     # ── Load LLM + LoRA ──
     from transformers import AutoModelForCausalLM
@@ -613,8 +652,11 @@ def train(config, args):
     best_val_loss = float("inf")
     jsonl_path = os.path.join(output_dir, "metrics_epoch.jsonl")
     grad_accum_steps = train_cfg.get("gradient_accumulation_steps", 1)
+    keyslice_alpha = train_cfg.get("keyslice_alpha", 0.0)
     print("Gradient accumulation steps: %d (effective batch = %d)" % (
         grad_accum_steps, train_cfg["batch_size"] * grad_accum_steps))
+    if keyslice_alpha > 0:
+        print("Key-slice loss weight: %.2f (Stage 2)" % keyslice_alpha)
 
     for epoch in range(start_epoch, train_cfg["max_epochs"]):
         print("\n[Epoch %d/%d]" % (epoch + 1, train_cfg["max_epochs"]))
@@ -622,7 +664,8 @@ def train(config, args):
         train_metrics = train_epoch(
             model, train_loader, optimizer, scheduler, device, epoch,
             max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
-            grad_accum_steps=grad_accum_steps)
+            grad_accum_steps=grad_accum_steps,
+            keyslice_alpha=keyslice_alpha)
 
         print("  Train loss: %.4f (steps: %d)" % (
             train_metrics["loss"], train_metrics["steps"]))

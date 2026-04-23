@@ -18,18 +18,7 @@ from scipy.ndimage import zoom as ndizoom
 
 from data.label_mapper import LabelMapper
 from utils.io import SEQUENCE_TYPES, load_nifti, normalize_axes
-
-
-# =========================================================================
-# Shared constants
-# =========================================================================
-SEQUENCE_ORDER = [
-    "axial_PD",
-    "coronal_PD",
-    "coronal_T2WI",
-    "sagittal_PD",
-    "sagittal_T1WI",
-]
+from utils.constants import SEQUENCE_ORDER
 
 
 # =========================================================================

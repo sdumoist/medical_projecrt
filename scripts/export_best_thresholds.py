@@ -10,11 +10,17 @@ Usage:
     python scripts/export_best_thresholds.py --exp_dir outputs/experiments_copas/CoPAS_orig_... --output thresholds.json
 """
 import os
+import sys
 import csv
 import json
 import argparse
 
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
+# ---- project imports -----------------------------------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from utils.constants import DISEASES
 
 
 def safe_float(val, default=0.0):

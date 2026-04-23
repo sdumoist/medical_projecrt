@@ -14,10 +14,13 @@ Architecture:
     Final:
         FinalHead(cat(sag_feat, cor_feat, axi_feat)) -> final logits [B, 7]
 
-    Optional localizer (when use_localizer=True):
-        Each branch encoder produces per-slice features [B, D', C].
-        A lightweight SliceHead predicts key-slice logits [B, 7, D'] per disease.
-        Supervised by key_slices from nnUNet masks via cross-entropy.
+    Optional grounded localizer (when use_localizer=True):
+        Disease-specific SliceHeads predict key-slice logits from the
+        corresponding anchor branch's slice features:
+            cor_slice_head: SST/LHBT/IGHL/GHOA on cor_pd_slice
+            axi_slice_head: IST/SSC on axi_pd_slice
+            sag_slice_head: RIPI on sag_pd_slice
+        SoftAttentionLocalTokenPooler extracts 7 disease-aware local tokens.
 
 Loss:
     alpha * (sag_loss + cor_loss + axi_loss) + final_loss
@@ -36,6 +39,7 @@ import torch.nn as nn
 from models.encoders import get_encoder
 from models.fusion_copas import CoPlaneAttention, CrossModalAttention
 from models.heads import BranchHead, FinalHead
+from utils.constants import NUM_DISEASES
 
 # Sequence name -> index (must match config data.sequences order)
 SEQ_INDEX = {
@@ -45,32 +49,6 @@ SEQ_INDEX = {
     'sagittal_PD': 3,
     'sagittal_T1WI': 4,
 }
-
-NUM_DISEASES = 7
-
-
-class SliceHead(nn.Module):
-    """Predict key-slice logits for each disease from per-slice features.
-
-    Input:  [B, D', C]  (per-slice features from one branch)
-    Output: [B, num_diseases, D']  (logits over slices per disease)
-    """
-
-    def __init__(self, feat_dim, num_diseases=7):
-        super().__init__()
-        self.fc = nn.Linear(feat_dim, num_diseases)
-
-    def forward(self, slice_features):
-        """
-        Args:
-            slice_features: [B, D', C]
-        Returns:
-            logits: [B, num_diseases, D']
-        """
-        # [B, D', C] -> [B, D', num_diseases]
-        logits = self.fc(slice_features)
-        # -> [B, num_diseases, D']
-        return logits.permute(0, 2, 1)
 
 
 class ShoulderCoPASModel(nn.Module):
@@ -135,11 +113,13 @@ class ShoulderCoPASModel(nn.Module):
                                      num_diseases=num_diseases, dropout=dropout,
                                      num_classes=num_classes)
 
-        # --- Localizer: key-slice prediction ---
+        # --- Grounded localizer: disease-specific key-slice heads ---
         if use_localizer:
-            # Use coronal_PD slice features as anchor for key-slice prediction
-            # (most diseases have coronal_PD as anchor sequence)
-            self.slice_head = SliceHead(feat_dim, num_diseases)
+            from models.grounding_heads import (
+                DiseaseSpecificSliceHeads, SoftAttentionLocalTokenPooler)
+            self.grounding_heads = DiseaseSpecificSliceHeads(feat_dim)
+            self.local_token_pooler = SoftAttentionLocalTokenPooler(
+                temperature=1.0)
 
     def _encode_slice(self, x, seq_name):
         """Encode a single sequence to per-slice features [B, D', C]."""
@@ -164,7 +144,11 @@ class ShoulderCoPASModel(nn.Module):
                 'sag_feat':      [B, feat_dim]
                 'cor_feat':      [B, feat_dim]
                 'axi_feat':      [B, feat_dim]
-                'slice_logits':  [B, num_diseases, D']  (only when use_localizer)
+                'sag_pd_slice':  [B, D', C]  (always returned)
+                'cor_pd_slice':  [B, D', C]  (always returned)
+                'axi_pd_slice':  [B, D', C]  (always returned)
+                'slice_logits':  [B, 7, D']  (only when use_localizer)
+                'local_tokens':  [B, 7, C]   (only when use_localizer)
         """
         # Extract individual sequences: x[:, i] -> [B, C, D, H, W]
         axi_pd = x[:, SEQ_INDEX['axial_PD']]
@@ -205,14 +189,20 @@ class ShoulderCoPASModel(nn.Module):
             'sag_feat': sag_feat,
             'cor_feat': cor_feat,
             'axi_feat': axi_feat,
+            # Always expose slice-level features for downstream consumers
+            'sag_pd_slice': sag_pd_slice,
+            'cor_pd_slice': cor_pd_slice,
+            'axi_pd_slice': axi_pd_slice,
         }
 
-        # === Localizer: key-slice prediction ===
+        # === Grounded localizer: disease-specific key-slice + local tokens ===
         if self.use_localizer:
-            # Use coronal_PD slice features as anchor
-            # cor_pd_slice: [B, D', C]
-            slice_logits = self.slice_head(cor_pd_slice)  # [B, 7, D']
+            slice_logits = self.grounding_heads(
+                sag_pd_slice, cor_pd_slice, axi_pd_slice)  # [B, 7, D']
+            local_tokens = self.local_token_pooler(
+                slice_logits, sag_pd_slice, cor_pd_slice, axi_pd_slice)  # [B, 7, C]
             result['slice_logits'] = slice_logits
+            result['local_tokens'] = local_tokens
 
         return result
 

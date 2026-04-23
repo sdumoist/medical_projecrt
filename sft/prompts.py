@@ -38,7 +38,8 @@ TASK_MESSAGES = {
             "content": (
                 "你是一位专业的肩关节MRI影像诊断AI助手。"
                 "你将根据MRI影像特征，输出完整的结构化诊断链，"
-                "包括病种标签、影像学证据、锚定序列、关键层面和感兴趣区域。"
+                "包括病种标签、影像学证据、锚定序列、关键层面、"
+                "结构化影像学所见和结构化影像学印象。"
                 "请严格以JSON格式输出。"
             ),
         },
@@ -46,11 +47,12 @@ TASK_MESSAGES = {
             "role": "user",
             "content": (
                 "请根据肩关节MRI输出结构化诊断链，包括：\n"
-                "1. labels：每种疾病的诊断标签\n"
+                "1. labels：每种疾病的诊断标签（1=阳性，0=阴性，-1=无法判断）\n"
                 "2. evidence：每种疾病的阳性和阴性证据文本\n"
                 "3. anchor_sequence：每种疾病最相关的MRI序列\n"
-                "4. key_slice：关键层面索引\n"
-                "5. roi_box：感兴趣区域边界框\n"
+                "4. key_slice：关键层面索引（由视觉定位模块辅助）\n"
+                "5. structured_findings：结构化影像学所见（句子列表）\n"
+                "6. structured_impression：结构化影像学印象（句子列表）\n"
                 f"疾病列表：{DISEASE_LIST_ZH}"
             ),
         },

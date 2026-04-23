@@ -6,28 +6,16 @@ import json
 import nibabel as nib
 import numpy as np
 
+from utils.constants import (  # noqa: F401 -- re-exported for backward compat
+    DISEASES, DISEASE_ANCHOR_SEQ,
+    SEQUENCE_ORDER as SEQUENCE_TYPES,
+    NUM_DISEASES,
+)
 
 # Data paths
 DATA_ROOT = os.environ.get("SHOULDER_DATA_ROOT", "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData")
 JSON_ROOT = os.environ.get("SHOULDER_JSON_ROOT", "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json")
 NNUNET_ROOT = os.environ.get("SHOULDER_NNUNET_ROOT", "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output")
-
-# Sequence types
-SEQUENCE_TYPES = ["axial_PD", "coronal_PD", "coronal_T2WI", "sagittal_PD", "sagittal_T1WI"]
-
-# Diseases
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
-
-# Disease to anchor sequence (best single sequence for each disease)
-DISEASE_ANCHOR_SEQ = {
-    "SST": "coronal_PD",   # 冈上肌腱
-    "IST": "axial_PD",     # 冈下肌腱
-    "SSC": "axial_PD",     # 肩胛下肌腱
-    "LHBT": "coronal_PD",   # 肱二头肌腱
-    "IGHL": "coronal_PD",  # 盂唇
-    "RIPI": "sagittal_PD", # 肩袖间隙
-    "GHOA": "coronal_PD",  # 盂肱关节
-}
 
 
 def get_image_path(exam_id, sequence):

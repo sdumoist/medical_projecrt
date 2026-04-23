@@ -11,8 +11,7 @@ from __future__ import print_function
 import numpy as np
 from typing import Dict, List, Tuple
 
-
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
+from utils.constants import DISEASES
 
 
 # ============================================================

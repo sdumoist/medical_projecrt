@@ -14,7 +14,7 @@ import torch.utils.data as data
 import torch.nn.functional as F
 import torchvision.transforms.functional as TF
 
-DISEASES = ['SST', 'IST', 'SSC', 'LHBT', 'IGHL', 'RIPI', 'GHOA']
+from utils.constants import DISEASES
 
 
 def load_metadata(metadata_csv, cache_root):

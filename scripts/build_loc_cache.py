@@ -38,27 +38,7 @@ if PROJECT_ROOT not in sys.path:
 
 from utils.io import load_nifti, normalize_axes
 from utils.seed import set_seed
-
-# ---- constants -----------------------------------------------------------
-SEQUENCE_ORDER = [
-    "axial_PD",
-    "coronal_PD",
-    "coronal_T2WI",
-    "sagittal_PD",
-    "sagittal_T1WI",
-]
-
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
-
-DISEASE_ANCHOR_SEQ = {
-    "SST":  "coronal_PD",
-    "IST":  "axial_PD",
-    "SSC":  "axial_PD",
-    "LHBT": "coronal_PD",
-    "IGHL": "coronal_PD",
-    "RIPI": "sagittal_PD",
-    "GHOA": "coronal_PD",
-}
+from utils.constants import DISEASES, SEQUENCE_ORDER, DISEASE_ANCHOR_SEQ
 
 PREPROCESS_VERSION = "v2"
 

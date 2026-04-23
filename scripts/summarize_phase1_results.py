@@ -10,12 +10,18 @@ Usage:
     python scripts/summarize_phase1_results.py --auto   # auto-discover all experiments
 """
 import os
+import sys
 import csv
 import json
 import argparse
 from pathlib import Path
 
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
+# ---- project imports -----------------------------------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from utils.constants import DISEASES
 
 # Experiment roots to scan in --auto mode
 DEFAULT_ROOTS = [

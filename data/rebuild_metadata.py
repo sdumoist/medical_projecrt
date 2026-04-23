@@ -7,14 +7,18 @@ import sys
 import csv
 import json
 
+# ---- project imports -----------------------------------------------------
+PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+if PROJECT_ROOT not in sys.path:
+    sys.path.insert(0, PROJECT_ROOT)
+
+from utils.constants import DISEASES, SEQUENCE_ORDER as SEQUENCE_TYPES
+
 # === Paths ===
 DATA_ROOT = "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
 JSON_ROOT = "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
 NNUNET_ROOT = "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
 OUTPUT_PATH = "/mnt/cfs_algo_bj/models/experiments/lirunze/code/project/outputs/metadata/metadata_master.csv"
-
-SEQUENCE_TYPES = ["axial_PD", "coronal_PD", "coronal_T2WI", "sagittal_PD", "sagittal_T1WI"]
-DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
 
 # Disease -> mask folders (priority order: best_pred first, then no_mask_pred as fallback)
 DISEASE_TO_MASK_FOLDERS = {

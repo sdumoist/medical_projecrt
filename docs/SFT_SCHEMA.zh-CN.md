@@ -76,7 +76,7 @@
 
 ### 2.2 `diagnosis_chain` — 结构化诊断链
 
-**output 格式**：
+**output 格式**（Grounded v1）：
 ```json
 {
   "labels": {"SST": 1, "IST": 0, ...},
@@ -100,13 +100,16 @@
     "GHOA": "coronal_PD"
   },
   "key_slice": {"SST": 12, "IST": null, ...},
-  "roi_box": {"SST": [3, 45, 120, 8, 89, 210], "IST": null, ...}
+  "structured_findings": ["冈上肌腱远侧段增粗，信号增高", ...],
+  "structured_impression": ["冈上肌腱撕裂", ...]
 }
 ```
 
-**key_slice**：整数索引（来自 cache_loc），无数据时为 null
+**key_slice**：整数索引（训练时来自 cache_loc 监督，推理时由视觉 grounding 模块内部预测）。无数据时为 null。
 
-**roi_box**：`[z_min, h_min, w_min, z_max, h_max, w_max]`，无数据时为 null
+**注意**：v1 已移除 `roi_box`，将在 v2 中作为 ROI head 加入。
+
+**grounding 设计**：`key_slice` 由视觉侧 DiseaseSpecificSliceHeads 预测，通过 SoftAttentionLocalTokenPooler 提取 7 个 disease-aware local tokens，与 3 个 global branch tokens 一同输入 LLM。LLM 输出的 `key_slice` 字段与视觉 grounding 结果对齐，形成一致的诊断链。
 
 ### 2.3 `structured_findings` — 结构化所见
 
