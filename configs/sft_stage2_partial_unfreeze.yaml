@@ -1,0 +1,77 @@
+# Stage 2: Partially unfrozen MRI-CV + VisualProjector + Qwen2.5-7B LoRA
+# Resume from Stage 1 best checkpoint.
+# Loss: LM only (differentiable auxiliary heads for label/keyslice loss are TODO)
+stage: 2
+
+# MRI-CV backbone
+mri_cv:
+  encoder: "swin3d_tiny"
+  checkpoint_path: "outputs/experiments/g3_swin_binary/best_model.pt"
+  use_localizer: false
+  freeze: false
+  unfreeze_layers: "last_stage"   # Only unfreeze last stage of each encoder
+  lr_multiplier: 0.1              # 10x lower LR for MRI-CV unfrozen layers
+
+# Visual projector
+projector:
+  num_visual_tokens: 3
+
+# LLM (same LoRA config as Stage 1)
+llm:
+  model_name: "Qwen/Qwen2.5-7B"
+  model_path: "Qwen/Qwen2.5-7B"
+  lora_rank: 16                   # Keep same as Stage 1
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  torch_dtype: "bfloat16"
+  use_flash_attn: true
+  gradient_checkpointing: true
+
+# Data (same as Stage 1)
+data:
+  cache_root: "outputs/cache_cls"
+  cache_mode: "cls"
+  cache_index: "outputs/cache_cls/cache_cls_index.csv"
+  max_seq_length: 2048
+
+  train_jsonl:
+    - "outputs/sft_data/split/sft_label_binary_train.jsonl"
+    - "outputs/sft_data/split/sft_diagnosis_chain_train.jsonl"
+    - "outputs/sft_data/split/sft_structured_findings_train.jsonl"
+    - "outputs/sft_data/split/sft_structured_impression_train.jsonl"
+
+  val_jsonl:
+    - "outputs/sft_data/split/sft_label_binary_val.jsonl"
+    - "outputs/sft_data/split/sft_diagnosis_chain_val.jsonl"
+
+# Training
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  num_workers: 4
+  max_epochs: 3
+  learning_rate: 0.00005          # 5e-5 (lower than Stage 1)
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  seed: 42
+
+  # Resume from Stage 1
+  # Pass --resume outputs/sft_experiments/sft_stage1_frozen/best_checkpoint.pt
+
+# Validation
+validation:
+  val_interval: 1
+  generation_max_length: 512
+
+# Output
+output:
+  exp_name: "sft_stage2_partial_unfreeze"
+  output_dir: "outputs/sft_experiments"
+
+# TODO: Joint loss with differentiable auxiliary heads
+# When implemented, add:
+# loss:
+#   label_alpha: 0.3
+#   keyslice_alpha: 0.1

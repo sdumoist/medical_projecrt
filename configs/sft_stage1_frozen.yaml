@@ -1,0 +1,65 @@
+# Stage 1: Frozen MRI-CV, train VisualProjector + Qwen2.5-7B LoRA
+stage: 1
+
+# MRI-CV backbone (frozen in Stage 1)
+mri_cv:
+  encoder: "swin3d_tiny"
+  checkpoint_path: "outputs/experiments/g3_swin_binary/best_model.pt"
+  use_localizer: false
+  freeze: true
+
+# Visual projector
+projector:
+  num_visual_tokens: 3
+  # cv_dim auto-inferred from encoder.num_features
+
+# LLM
+llm:
+  model_name: "Qwen/Qwen2.5-7B"
+  model_path: "Qwen/Qwen2.5-7B"   # Set to local path on cluster
+  lora_rank: 16
+  lora_alpha: 32
+  lora_dropout: 0.05
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  torch_dtype: "bfloat16"
+  use_flash_attn: true
+  gradient_checkpointing: true
+
+# Data
+data:
+  cache_root: "outputs/cache_cls"
+  cache_mode: "cls"
+  cache_index: "outputs/cache_cls/cache_cls_index.csv"
+  max_seq_length: 2048
+
+  train_jsonl:
+    - "outputs/sft_data/split/sft_label_binary_train.jsonl"
+    - "outputs/sft_data/split/sft_diagnosis_chain_train.jsonl"
+    - "outputs/sft_data/split/sft_structured_findings_train.jsonl"
+    - "outputs/sft_data/split/sft_structured_impression_train.jsonl"
+
+  val_jsonl:
+    - "outputs/sft_data/split/sft_label_binary_val.jsonl"
+    - "outputs/sft_data/split/sft_diagnosis_chain_val.jsonl"
+
+# Training
+training:
+  batch_size: 2               # Per GPU
+  gradient_accumulation_steps: 4
+  num_workers: 4
+  max_epochs: 5
+  learning_rate: 0.0002       # 2e-4
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  seed: 42
+
+# Validation
+validation:
+  val_interval: 1
+  generation_max_length: 512
+
+# Output
+output:
+  exp_name: "sft_stage1_frozen"
+  output_dir: "outputs/sft_experiments"
