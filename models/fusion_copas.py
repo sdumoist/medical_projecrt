@@ -119,7 +119,7 @@ class CrossModalAttention(nn.Module):
 
         self.gate = nn.Sequential(
             nn.Linear(2 * feature_dim, feature_dim),
-            nn.BatchNorm1d(feature_dim),
+            nn.LayerNorm(feature_dim),
             nn.Sigmoid()
         )
 

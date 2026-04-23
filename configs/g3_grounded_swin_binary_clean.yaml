@@ -1,0 +1,74 @@
+# G3G-Clean: Grounded Swin3D-Tiny + disease-specific key-slice localizer
+# Clean data: all 7 diseases binary (0/1), no postop, no low quality, no excluded
+# Classification + key_slice joint training (grounded visual backbone)
+
+# Data config
+data:
+  data_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
+  json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
+  nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
+
+  use_cache: true
+  cache_mode: loc
+  cache_root: outputs_clean/cache_loc
+
+  sequences:
+    - axial_PD
+    - coronal_PD
+    - coronal_T2WI
+    - sagittal_PD
+    - sagittal_T1WI
+
+  diseases:
+    - SST
+    - IST
+    - SSC
+    - LHBT
+    - IGHL
+    - RIPI
+    - GHOA
+
+# Model config
+model:
+  name: "swin_copas_grounded"
+  encoder: "swin3d_tiny"
+  pretrained: false
+
+  # D' = 10 after patch_size=(2,4,4)
+  use_localizer: true
+  localizer_mode: "key_slice"
+
+# Training config
+training:
+  num_classes: 2
+
+  batch_size: 8
+  num_workers: 0
+  max_epochs: 50
+  learning_rate: 0.0001
+
+  optimizer: "adam"
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 5
+
+  loss: "bce"
+
+  patience: 15
+  dropout: 0.3
+
+  # L = L_cls + 0.3 * L_branch + 0.5 * L_keyslice
+  branch_alpha: 0.3
+  localizer_alpha: 0.5
+
+# Validation config
+validation:
+  val_interval: 1
+  save_best: true
+
+# Output config
+output:
+  exp_name: "g3_grounded_swin_binary_clean"
+  output_dir: "outputs_clean/experiments"
+  save_tokens: false
+  tokens_dir: "outputs_clean/tokens"
