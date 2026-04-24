@@ -6,6 +6,8 @@ Supports:
   - cache_cls / cache_loc / raw nii data sources
   - optional localizer loss for G1L / G2L
   - binary (num_classes=2) and ternary (num_classes=3) classification
+  - DDP multi-GPU training (torchrun)
+  - AMP mixed precision (bf16/fp16)
 """
 import os
 import csv
@@ -17,6 +19,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
+from torch.utils.data.distributed import DistributedSampler
 
 from utils import set_seed, DISEASES
 from utils.io import list_exam_ids, load_json_label
@@ -25,6 +30,31 @@ from data.shoulder_dataset import ShoulderCacheDataset, ShoulderDataset3D
 from models import create_model
 from utils.losses import MaskedBCEWithLogitsLoss, MaskedCrossEntropyLoss
 from utils.metrics import compute_per_disease_metrics
+
+
+# ── DDP helpers ──────────────────────────────────────────────
+def setup_ddp():
+    """Initialize DDP if launched via torchrun. Returns (local_rank, is_ddp)."""
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        rank = int(os.environ['RANK'])
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        return local_rank, True
+    return 0, False
+
+
+def is_main_process():
+    """True on rank 0 or non-DDP."""
+    if not dist.is_initialized():
+        return True
+    return dist.get_rank() == 0
+
+
+def cleanup_ddp():
+    if dist.is_initialized():
+        dist.destroy_process_group()
 
 
 def load_config(config_path):
@@ -117,7 +147,7 @@ def build_exam_list(config):
     return valid_exams
 
 
-def create_dataloaders(config, raw_labels_lookup, project_root):
+def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
     """Create train and val DataLoaders based on config."""
     cache_mode = config['data'].get('cache_mode', 'none')
     use_cache = config['data'].get('use_cache', False)
@@ -210,10 +240,15 @@ def create_dataloaders(config, raw_labels_lookup, project_root):
             mode="val",
         )
 
+    # DDP samplers
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_ddp else None
+    val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_ddp else None
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
@@ -222,8 +257,10 @@ def create_dataloaders(config, raw_labels_lookup, project_root):
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=True,
+        drop_last=True,
     )
 
     return train_loader, val_loader
@@ -290,7 +327,7 @@ def compute_total_loss(output, labels, mask, criterion, branch_alpha,
 
 def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 mode="train", localizer_alpha=0.0, use_localizer=False,
-                num_classes=2):
+                num_classes=2, scaler=None):
     """Train or validate for one epoch."""
     model.train() if mode == "train" else model.eval()
 
@@ -316,6 +353,8 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
         iter_ = lambda x: x
 
     ctx = torch.no_grad() if mode != "train" else torch.enable_grad()
+    use_amp = (scaler is not None)
+
     with ctx:
         for batch in iter_(loader):
             images = batch["image"].to(device)
@@ -333,15 +372,16 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 if "localizer_mask" in batch:
                     model_kwargs["localizer_mask"] = batch["localizer_mask"].to(device)
 
-            output = model(images, **model_kwargs)
+            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+                output = model(images, **model_kwargs)
 
-            loss, loss_dict = compute_total_loss(
-                output, labels, mask_labels, criterion, branch_alpha,
-                localizer_alpha=localizer_alpha,
-                batch=batch,
-                use_localizer=use_localizer,
-                num_classes=num_classes,
-            )
+                loss, loss_dict = compute_total_loss(
+                    output, labels, mask_labels, criterion, branch_alpha,
+                    localizer_alpha=localizer_alpha,
+                    batch=batch,
+                    use_localizer=use_localizer,
+                    num_classes=num_classes,
+                )
 
             # One-time debug for localizer
             if num_batches == 0 and use_localizer and mode == "train":
@@ -354,8 +394,13 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                       flush=True)
 
             if mode == "train":
-                loss.backward()
-                optimizer.step()
+                if use_amp:
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    loss.backward()
+                    optimizer.step()
 
             for k in total_losses:
                 total_losses[k] += loss_dict.get(k, 0.0)
@@ -428,8 +473,12 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
 
 def train(config, output_dir):
     """Main training function."""
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Using device: %s" % device)
+    local_rank, is_ddp = setup_ddp()
+    device = torch.device("cuda", local_rank) if is_ddp else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if is_main_process():
+        print("Using device: %s (DDP=%s, world_size=%s)" % (
+            device, is_ddp,
+            dist.get_world_size() if is_ddp else 1))
 
     set_seed(config.get("seed", 42))
 
@@ -440,19 +489,20 @@ def train(config, output_dir):
     raw_labels_lookup = load_raw_labels(config)
 
     # Create data loaders
-    train_loader, val_loader = create_dataloaders(config, raw_labels_lookup, project_root)
+    train_loader, val_loader = create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=is_ddp)
 
     # Localizer settings
     use_localizer = config['model'].get('use_localizer', False)
     localizer_alpha = config['training'].get('localizer_alpha', 0.0)
-    if use_localizer:
+    if use_localizer and is_main_process():
         print("Localizer enabled: alpha=%.3f" % localizer_alpha)
 
     # Task mode
     num_classes = config['training'].get('num_classes', 2)
     is_binary = (num_classes == 2)
     task_mode = "ternary" if num_classes == 3 else "binary"
-    print("Task mode: %s (num_classes=%d)" % (task_mode, num_classes))
+    if is_main_process():
+        print("Task mode: %s (num_classes=%d)" % (task_mode, num_classes))
 
     # Create model
     branch_alpha = config['training'].get('branch_alpha', 0.3)
@@ -469,12 +519,18 @@ def train(config, output_dir):
     model = model.to(device)
 
     # Multi-GPU support
-    if torch.cuda.device_count() > 1:
+    if is_ddp:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
+        if is_main_process():
+            print("Using DDP with %d GPUs" % dist.get_world_size())
+    elif torch.cuda.device_count() > 1:
         print("Using %d GPUs with DataParallel" % torch.cuda.device_count())
         model = nn.DataParallel(model)
 
     n_params = sum(p.numel() for p in model.parameters())
-    print("Model parameters: %d (%.1fM)" % (n_params, n_params / 1e6))
+    if is_main_process():
+        print("Model parameters: %d (%.1fM)" % (n_params, n_params / 1e6))
 
     # Loss function
     if is_binary:
@@ -493,6 +549,12 @@ def train(config, output_dir):
         optimizer, T_max=config['training']['max_epochs']
     )
 
+    # AMP scaler (bf16)
+    use_amp = config['training'].get('use_amp', True)
+    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    if is_main_process() and use_amp:
+        print("AMP enabled (bf16)")
+
     # Training loop
     best_f1 = 0
     patience_counter = 0
@@ -501,19 +563,24 @@ def train(config, output_dir):
     jsonl_path = os.path.join(output_dir, "metrics_epoch.jsonl")
 
     for epoch in range(epochs):
+        # DDP: set epoch for sampler shuffling
+        if is_ddp and hasattr(train_loader.sampler, 'set_epoch'):
+            train_loader.sampler.set_epoch(epoch)
+
         cur_lr = optimizer.param_groups[0]['lr']
-        print("[Epoch %d/%d] lr=%.6f" % (epoch + 1, epochs, cur_lr))
+        if is_main_process():
+            print("[Epoch %d/%d] lr=%.6f" % (epoch + 1, epochs, cur_lr))
 
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion, device, branch_alpha,
             "train", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
-            num_classes=num_classes)
+            num_classes=num_classes, scaler=scaler)
 
         if (epoch + 1) % config['validation']['val_interval'] == 0:
             val_metrics = train_epoch(
                 model, val_loader, optimizer, criterion, device, branch_alpha,
                 "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
-                num_classes=num_classes)
+                num_classes=num_classes, scaler=None)
 
             # --- Macro averages ---
             train_macro = summarize_macro_metrics(train_metrics)
@@ -522,7 +589,20 @@ def train(config, output_dir):
             avg_f1 = val_macro['avg_f1']
             is_best = avg_f1 > best_f1
 
-            # --- Print losses ---
+            if not is_main_process():
+                # Non-rank-0: just update best_f1 and patience
+                if is_best:
+                    best_f1 = avg_f1
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                patience = config['training'].get('patience', 10)
+                if patience_counter >= patience:
+                    break
+                scheduler.step()
+                continue
+
+            # --- Print losses (rank 0 only) ---
             print("Epoch %d/%d" % (epoch + 1, epochs))
             loss_str = "  Train Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f" % (
                 train_metrics['loss'], train_metrics['loss_final'],
@@ -686,7 +766,9 @@ def train(config, output_dir):
 
         scheduler.step()
 
-    print("Training complete! Best avg F1: %.4f" % best_f1)
+    if is_main_process():
+        print("Training complete! Best avg F1: %.4f" % best_f1)
+    cleanup_ddp()
     return model
 
 
