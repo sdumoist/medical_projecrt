@@ -262,19 +262,20 @@ def compute_total_loss(output, labels, mask, criterion, branch_alpha,
         if key_slices is not None:
             slice_logits = output['slice_logits']  # [B, 7, D']
             B, num_diseases, D = slice_logits.shape
-            key_slices = key_slices.to(slice_logits.device).float()
+
+            orig_ks = key_slices.to(slice_logits.device)          # [B, 7], long
+            key_slices_f = orig_ks.float()
 
             # Rescale key_slices from input Z-space to feature D'-space
             input_Z = batch["image"].shape[3]  # [B, 5, 1, Z, H, W]
-            key_slices_scaled = (key_slices * D / input_Z).long().clamp(0, D - 1)
+            key_slices_scaled = (key_slices_f * D / input_Z).long().clamp(0, D - 1)
 
-            # Only supervise where key_slice >= 0 and label mask > 0
-            orig_ks = batch.get("key_slices").to(slice_logits.device)
-            valid = (orig_ks >= 0) & (mask > 0)
+            # Clean v1: localizer validity depends only on key_slice existence
+            valid = (orig_ks >= 0)
 
             if valid.any() and D > 1:
-                target = key_slices_scaled[valid]  # [N]
-                pred = slice_logits[valid]  # [N, D]
+                pred = slice_logits[valid]              # [N, D]
+                target = key_slices_scaled[valid]       # [N]
                 loc_loss = nn.functional.cross_entropy(pred, target)
                 total_loss = total_loss + localizer_alpha * loc_loss
                 loss_dict['localizer'] = loc_loss.item()
@@ -341,6 +342,16 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 use_localizer=use_localizer,
                 num_classes=num_classes,
             )
+
+            # One-time debug for localizer
+            if num_batches == 0 and use_localizer and mode == "train":
+                ks = batch.get("key_slices")
+                print("[DEBUG localizer] batch0:",
+                      "has_ks=%s" % (ks is not None),
+                      "ks_min/max=%d/%d" % (ks.min().item(), ks.max().item()) if ks is not None else "",
+                      "has_slice_logits=%s" % ("slice_logits" in output),
+                      "loc_loss=%.4f" % loss_dict.get("localizer", -1),
+                      flush=True)
 
             if mode == "train":
                 loss.backward()
