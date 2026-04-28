@@ -187,6 +187,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
 
         print("Split: train=%d, val=%d" % (len(train_ids), len(val_ids)))
 
+        load_dense_masks = config['data'].get('load_dense_masks', False)
         train_dataset = ShoulderCacheDataset(
             cache_root=cache_root,
             exam_ids=train_id_set,
@@ -194,6 +195,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             raw_labels_lookup=raw_labels_lookup,
             cache_mode=cache_mode,
             project_root=project_root,
+            load_dense_masks=load_dense_masks,
         )
         val_dataset = ShoulderCacheDataset(
             cache_root=cache_root,
@@ -202,6 +204,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             raw_labels_lookup=raw_labels_lookup,
             cache_mode=cache_mode,
             project_root=project_root,
+            load_dense_masks=load_dense_masks,
         )
     else:
         # Raw NIfTI mode
@@ -241,9 +244,10 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             mode="val",
         )
 
-    # DDP samplers
+    # DDP: only train_loader uses DistributedSampler.
+    # val_loader always uses the full val_dataset on every rank (rank 0 runs it,
+    # others skip via barrier), so no DistributedSampler for val.
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_ddp else None
-    val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_ddp else None
 
     pw = num_workers > 0
     train_loader = DataLoader(
@@ -261,10 +265,10 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        sampler=val_sampler,
+        sampler=None,           # no DistributedSampler: full set on rank 0
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=False,        # must be False for val (no sample loss)
         persistent_workers=pw,
         prefetch_factor=2 if pw else None,
     )
@@ -333,7 +337,7 @@ def compute_total_loss(output, labels, mask, criterion, branch_alpha,
 
 def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 mode="train", localizer_alpha=0.0, use_localizer=False,
-                num_classes=2, scaler=None):
+                num_classes=2, scaler=None, amp_dtype=torch.bfloat16):
     """Train or validate for one epoch."""
     model.train() if mode == "train" else model.eval()
 
@@ -359,7 +363,7 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
         iter_ = lambda x: x
 
     ctx = torch.no_grad() if mode != "train" else torch.enable_grad()
-    use_amp = (scaler is not None)
+    use_amp = (scaler is not None) or (amp_dtype != torch.float32)
 
     with ctx:
         for batch in iter_(loader):
@@ -378,7 +382,7 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 if "localizer_mask" in batch:
                     model_kwargs["localizer_mask"] = batch["localizer_mask"].to(device)
 
-            with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
+            with torch.amp.autocast('cuda', dtype=amp_dtype, enabled=use_amp):
                 output = model(images, **model_kwargs)
 
                 loss, loss_dict = compute_total_loss(
@@ -563,11 +567,15 @@ def train(config, output_dir):
         optimizer, T_max=config['training']['max_epochs']
     )
 
-    # AMP scaler (bf16)
+    # AMP scaler: only for fp16; bf16 uses autocast without GradScaler
     use_amp = config['training'].get('use_amp', True)
-    scaler = torch.amp.GradScaler('cuda') if use_amp else None
+    amp_dtype_str = config['training'].get('amp_dtype', 'bfloat16')
+    amp_dtype = torch.bfloat16 if amp_dtype_str == 'bfloat16' else torch.float16
+    # GradScaler is only needed for fp16; bf16 does not require loss scaling
+    scaler = torch.amp.GradScaler('cuda') if (use_amp and amp_dtype == torch.float16) else None
     if is_main_process() and use_amp:
-        print("AMP enabled (bf16)")
+        print("AMP enabled (%s%s)" % (amp_dtype_str,
+              ", GradScaler" if scaler is not None else ", no GradScaler"))
 
     # Training loop
     best_metric = 0
@@ -588,34 +596,39 @@ def train(config, output_dir):
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion, device, branch_alpha,
             "train", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
-            num_classes=num_classes, scaler=scaler)
+            num_classes=num_classes, scaler=scaler, amp_dtype=amp_dtype)
 
         if (epoch + 1) % config['validation']['val_interval'] == 0:
-            val_metrics = train_epoch(
-                model, val_loader, optimizer, criterion, device, branch_alpha,
-                "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
-                num_classes=num_classes, scaler=None)
+            # ── Validation: only rank 0 runs full val set ──────────────────
+            # Non-rank-0 processes wait at a barrier while rank 0 validates.
+            # This guarantees metrics come from the complete val set.
+            if is_ddp and not is_main_process():
+                dist.barrier()  # wait for rank 0 to finish val
+            else:
+                val_metrics = train_epoch(
+                    model, val_loader, optimizer, criterion, device, branch_alpha,
+                    "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
+                    num_classes=num_classes, scaler=None, amp_dtype=amp_dtype)
+                if is_ddp:
+                    dist.barrier()  # signal other ranks that val is done
 
-            # --- Macro averages ---
+            # ── After barrier: only rank 0 computes metrics and decides stop ─
+            if not is_main_process():
+                # Receive early-stop decision broadcast from rank 0
+                stop_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+                dist.broadcast(stop_tensor, src=0)
+                if stop_tensor.item() == 1:
+                    break
+                scheduler.step()
+                continue
+
+            # --- Macro averages (rank 0 only) ---
             train_macro = summarize_macro_metrics(train_metrics)
             val_macro = summarize_macro_metrics(val_metrics)
 
             avg_f1 = val_macro['avg_f1']
             cur_metric = val_macro['avg_opt_f1']   # early-stop / best-model on opt_f1
             is_best = cur_metric > best_metric
-
-            if not is_main_process():
-                # Non-rank-0: just update best_metric and patience
-                if is_best:
-                    best_metric = cur_metric
-                    patience_counter = 0
-                else:
-                    patience_counter += 1
-                patience = config['training'].get('patience', 10)
-                if patience_counter >= patience:
-                    break
-                scheduler.step()
-                continue
 
             # --- Print losses (rank 0 only) ---
             print("Epoch %d/%d" % (epoch + 1, epochs))
@@ -775,8 +788,17 @@ def train(config, output_dir):
                 patience_counter += 1
 
             patience = config['training'].get('patience', 10)
-            if patience_counter >= patience:
+            should_stop = (patience_counter >= patience)
+            if should_stop:
                 print("Early stopping at epoch %d" % (epoch + 1))
+
+            # Broadcast early-stop decision to all DDP ranks
+            if is_ddp:
+                stop_tensor = torch.tensor([1 if should_stop else 0],
+                                           dtype=torch.int32, device=device)
+                dist.broadcast(stop_tensor, src=0)
+
+            if should_stop:
                 break
 
         scheduler.step()

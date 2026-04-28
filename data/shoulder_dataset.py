@@ -31,6 +31,10 @@ class ShoulderCacheDataset(Dataset):
     Works with both cache_cls and cache_loc formats.
     cache_cls record: {exam_id, image[5,Z,H,W], sequence_order, spatial_meta}
     cache_loc record: {exam_id, image[5,Z,H,W], mask{...}, key_slices, roi_boxes, ...}
+
+    For cache_loc, use load_dense_masks=False (default) to skip building
+    localizer_mask and roi_boxes tensors.  This saves memory and I/O when
+    only key_slices supervision is needed (Step 1 grounded training).
     """
 
     def __init__(
@@ -42,6 +46,7 @@ class ShoulderCacheDataset(Dataset):
         cache_mode="cls",
         project_root=None,
         min_z=32,
+        load_dense_masks=False,
     ):
         """
         Args:
@@ -53,9 +58,14 @@ class ShoulderCacheDataset(Dataset):
             project_root: root dir to resolve relative cache_path; defaults to cwd
             min_z: minimum Z dimension; pads with zeros if cache Z < min_z
                    (DenseNet needs Z>=32 due to 5 pooling stages)
+            load_dense_masks: if False (default), cache_loc only returns
+                              image/labels/mask/key_slices — skips building
+                              roi_boxes and localizer_mask tensors.
+                              Set True only when dense mask supervision is needed.
         """
         self.cache_mode = cache_mode
         self.min_z = min_z
+        self.load_dense_masks = load_dense_masks
         self.label_mapper = label_mapper
         self.raw_labels_lookup = raw_labels_lookup or {}
         self.project_root = project_root or os.getcwd()
@@ -129,11 +139,9 @@ class ShoulderCacheDataset(Dataset):
             "mask": mask,       # [7]  (label mask, not segmentation mask)
         }
 
-        # For cache_loc, also pass segmentation masks and localizer targets
+        # For cache_loc, also pass localizer targets
         if self.cache_mode == "loc":
-            seg_masks = record.get("mask", {})
             key_slices_raw = record.get("key_slices", {})
-            roi_boxes_raw = record.get("roi_boxes", {})
 
             from data.label_mapper import DISEASES
 
@@ -149,24 +157,29 @@ class ShoulderCacheDataset(Dataset):
                     ks[i] = v + z_offset
             out["key_slices"] = ks
 
-            # roi_boxes: dict -> tensor [7, 6], zeros for missing
-            rb = torch.zeros(7, 6, dtype=torch.float32)
-            for i, d in enumerate(DISEASES):
-                box = roi_boxes_raw.get(d, None)
-                if box is not None and len(box) == 6:
-                    rb[i] = torch.tensor(box, dtype=torch.float32)
-            out["roi_boxes"] = rb
+            if self.load_dense_masks:
+                # roi_boxes and localizer_mask: only loaded when explicitly requested
+                seg_masks = record.get("mask", {})
+                roi_boxes_raw = record.get("roi_boxes", {})
 
-            # seg_masks: dict -> tensor [7, Z', H, W] (padded same as image)
-            sample_img = record["image"]  # [5, Z, H, W]
-            Z_orig, H, W = sample_img.shape[1], sample_img.shape[2], sample_img.shape[3]
-            Z_out = max(Z_orig, self.min_z)
-            sm = torch.zeros(7, Z_out, H, W, dtype=torch.int64)
-            for i, d in enumerate(DISEASES):
-                m = seg_masks.get(d, None)
-                if m is not None and isinstance(m, torch.Tensor):
-                    sm[i, z_offset:z_offset + Z_orig] = m
-            out["localizer_mask"] = sm
+                # roi_boxes: dict -> tensor [7, 6], zeros for missing
+                rb = torch.zeros(7, 6, dtype=torch.float32)
+                for i, d in enumerate(DISEASES):
+                    box = roi_boxes_raw.get(d, None)
+                    if box is not None and len(box) == 6:
+                        rb[i] = torch.tensor(box, dtype=torch.float32)
+                out["roi_boxes"] = rb
+
+                # seg_masks: dict -> tensor [7, Z', H, W] (padded same as image)
+                sample_img = record["image"]  # [5, Z, H, W]
+                Z_orig, H, W = sample_img.shape[1], sample_img.shape[2], sample_img.shape[3]
+                Z_out = max(Z_orig, self.min_z)
+                sm = torch.zeros(7, Z_out, H, W, dtype=torch.int64)
+                for i, d in enumerate(DISEASES):
+                    m = seg_masks.get(d, None)
+                    if m is not None and isinstance(m, torch.Tensor):
+                        sm[i, z_offset:z_offset + Z_orig] = m
+                out["localizer_mask"] = sm
 
         return out
 
