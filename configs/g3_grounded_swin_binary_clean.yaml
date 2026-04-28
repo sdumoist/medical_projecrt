@@ -43,7 +43,7 @@ training:
   num_classes: 2
 
   batch_size: 4
-  num_workers: 4
+  num_workers: 2
   max_epochs: 50
   learning_rate: 0.0001
 

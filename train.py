@@ -13,6 +13,7 @@ import os
 import csv
 import json
 import yaml
+import datetime
 import argparse
 import warnings
 import numpy as np
@@ -244,6 +245,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_ddp else None
     val_sampler = DistributedSampler(val_dataset, shuffle=False) if is_ddp else None
 
+    pw = num_workers > 0
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
@@ -252,6 +254,8 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=pw,
+        prefetch_factor=2 if pw else None,
     )
     val_loader = DataLoader(
         val_dataset,
@@ -261,6 +265,8 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
         num_workers=num_workers,
         pin_memory=True,
         drop_last=True,
+        persistent_workers=pw,
+        prefetch_factor=2 if pw else None,
     )
 
     return train_loader, val_loader
@@ -417,10 +423,10 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 probs = torch.softmax(output['final_logits'], dim=2)
                 preds = probs.argmax(dim=2)  # [B, num_diseases]
 
-            all_preds.append(preds.cpu().numpy())
-            all_probs.append(probs.detach().cpu().numpy())
-            all_labels.append(labels.cpu().numpy())
-            all_masks.append(mask_labels.cpu().numpy())
+            all_preds.append(preds.float().cpu().numpy())
+            all_probs.append(probs.detach().float().cpu().numpy())
+            all_labels.append(labels.float().cpu().numpy())
+            all_masks.append(mask_labels.float().cpu().numpy())
 
             # Collect localizer slice predictions for metrics
             # NOTE: pred_slice_idx is in D' (feature) space.
@@ -429,7 +435,7 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
             if use_localizer and 'slice_logits' in output:
                 slice_logits = output['slice_logits']  # [B, 7, D']
                 D_prime = slice_logits.shape[2]
-                pred_slice_idx = slice_logits.argmax(dim=2).cpu().numpy()  # [B, 7]
+                pred_slice_idx = slice_logits.argmax(dim=2).float().cpu().numpy()  # [B, 7]
                 all_pred_slices.append(pred_slice_idx)
                 if "key_slices" in batch:
                     gt_ks = batch["key_slices"].numpy()  # [B, 7] in Z space
@@ -510,6 +516,7 @@ def train(config, output_dir):
         encoder=config['model']['encoder'],
         num_diseases=len(config['data']['diseases']),
         pretrained=config['model']['pretrained'],
+        pretrained_path=config['model'].get('pretrained_path'),
         dropout=config['training'].get('dropout', 0.3),
         num_heads=config['model'].get('num_heads', 4),
         branch_alpha=branch_alpha,
@@ -521,7 +528,7 @@ def train(config, output_dir):
     # Multi-GPU support
     if is_ddp:
         model = DDP(model, device_ids=[local_rank], output_device=local_rank,
-                    find_unused_parameters=True)
+                    find_unused_parameters=False)
         if is_main_process():
             print("Using DDP with %d GPUs" % dist.get_world_size())
     elif torch.cuda.device_count() > 1:
@@ -534,7 +541,14 @@ def train(config, output_dir):
 
     # Loss function
     if is_binary:
-        criterion = MaskedBCEWithLogitsLoss()
+        # pos_weight = neg/pos per disease, matches project overview table
+        # SST: 0.20, IST: 2.72, SSC: 4.23, LHBT: 3.31, IGHL: 2.66, RIPI: 1.76, GHOA: 2.63
+        _pw_values = config['training'].get(
+            'pos_weights',
+            [0.20, 2.72, 4.23, 3.31, 2.66, 1.76, 2.63]
+        )
+        pos_weight = torch.tensor(_pw_values, dtype=torch.float32)
+        criterion = MaskedBCEWithLogitsLoss(pos_weight=pos_weight)
     else:
         label_smoothing = config['training'].get('label_smoothing', 0.0)
         criterion = MaskedCrossEntropyLoss(label_smoothing=label_smoothing)
@@ -556,7 +570,7 @@ def train(config, output_dir):
         print("AMP enabled (bf16)")
 
     # Training loop
-    best_f1 = 0
+    best_metric = 0
     patience_counter = 0
     epochs = config['training']['max_epochs']
     csv_path = os.path.join(output_dir, "metrics_epoch.csv")
@@ -587,12 +601,13 @@ def train(config, output_dir):
             val_macro = summarize_macro_metrics(val_metrics)
 
             avg_f1 = val_macro['avg_f1']
-            is_best = avg_f1 > best_f1
+            cur_metric = val_macro['avg_opt_f1']   # early-stop / best-model on opt_f1
+            is_best = cur_metric > best_metric
 
             if not is_main_process():
-                # Non-rank-0: just update best_f1 and patience
+                # Non-rank-0: just update best_metric and patience
                 if is_best:
-                    best_f1 = avg_f1
+                    best_metric = cur_metric
                     patience_counter = 0
                 else:
                     patience_counter += 1
@@ -640,7 +655,7 @@ def train(config, output_dir):
 
             print("  Avg F1: %.4f  AUC: %.4f  OptF1: %.4f  Recall: %.4f  Prec: %.4f  (best F1: %.4f)" % (
                 val_macro['avg_f1'], val_macro['avg_auc'], val_macro['avg_opt_f1'],
-                val_macro['avg_recall'], val_macro['avg_precision'], best_f1))
+                val_macro['avg_recall'], val_macro['avg_precision'], best_metric))
 
             # Print key-slice metrics if available
             if 'key_slice' in val_metrics:
@@ -666,7 +681,7 @@ def train(config, output_dir):
                 'val_avg_recall': val_macro['avg_recall'],
                 'val_avg_precision': val_macro['avg_precision'],
                 'val_avg_opt_f1': val_macro['avg_opt_f1'],
-                'best_avg_f1': max(best_f1, avg_f1),
+                'best_avg_f1': max(best_metric, cur_metric),
                 'is_best': int(is_best),
             }
             # Per-disease val F1/AUC/opt in CSV
@@ -699,7 +714,7 @@ def train(config, output_dir):
                                       for d in DISEASES},
                 'val_per_disease': {d: val_metrics.get(d, {})
                                     for d in DISEASES},
-                'best_avg_f1': max(best_f1, avg_f1),
+                'best_avg_f1': max(best_metric, cur_metric),
                 'is_best': is_best,
             }
             if 'key_slice' in val_metrics:
@@ -722,7 +737,7 @@ def train(config, output_dir):
 
             # --- Save best_model.pt ---
             if is_best:
-                best_f1 = avg_f1
+                best_metric = cur_metric
                 save_path = os.path.join(output_dir, "best_model.pt")
                 torch.save({
                     'epoch': epoch,
@@ -767,7 +782,7 @@ def train(config, output_dir):
         scheduler.step()
 
     if is_main_process():
-        print("Training complete! Best avg F1: %.4f" % best_f1)
+        print("Training complete! Best avg opt_f1: %.4f" % best_metric)
     cleanup_ddp()
     return model
 
@@ -784,7 +799,8 @@ def main():
         output_dir = args.output
     else:
         exp_name = config['output']['exp_name']
-        output_dir = os.path.join(config['output']['output_dir'], exp_name)
+        timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_dir = os.path.join(config['output']['output_dir'], "%s_%s" % (exp_name, timestamp))
 
     os.makedirs(output_dir, exist_ok=True)
     print("Output directory: %s" % output_dir)

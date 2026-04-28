@@ -1,0 +1,50 @@
+# MRI-CV screening: Swin-UNETR encoder initialized from MONAI SSL checkpoint
+# model_swinvit.pt: embed_dim=48, patch_size=(2,2,2), depths=(2,2,2,2)
+
+data:
+  data_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
+  json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
+  nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
+  use_cache: true
+  cache_mode: cls
+  cache_root: outputs_clean/cache_cls
+  sequences:
+    - axial_PD
+    - coronal_PD
+    - coronal_T2WI
+    - sagittal_PD
+    - sagittal_T1WI
+  diseases: [SST, IST, SSC, LHBT, IGHL, RIPI, GHOA]
+
+model:
+  name: "mricv_swinunetr_binary"
+  encoder: "swin3d_unetr"
+  pretrained: true
+  pretrained_path: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shoulder_pretrain_repos/Swin-UNETR/weights/model_swinvit.pt"
+  use_localizer: false
+  localizer_mode: "key_slice"
+
+training:
+  num_classes: 2
+  batch_size: 2
+  num_workers: 4
+  max_epochs: 30
+  learning_rate: 0.00014  # sqrt scaling: 5e-5 * sqrt(8) ≈ 1.4e-4
+  optimizer: "adam"
+  weight_decay: 0.0001
+  scheduler: "cosine"
+  warmup_epochs: 3
+  loss: "bce"
+  branch_alpha: 0.3
+  patience: 20
+  use_amp: true
+
+validation:
+  val_interval: 1
+  save_best: true
+
+output:
+  exp_name: "mricv_swinunetr_binary"
+  output_dir: "outputs_clean/experiments"
+  save_tokens: false
+  tokens_dir: "outputs/tokens"

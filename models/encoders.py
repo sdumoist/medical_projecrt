@@ -7,6 +7,7 @@ Key change: encoders output spatial feature maps, NOT pooled vectors.
 - forward_slice() -> [B, D', C]     (pool H'W', keep depth for CoPlaneAttention)
 - forward_pool()  -> [B, C]         (global pool, for CrossModalAttention)
 """
+import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -500,9 +501,17 @@ class SwinTransformer3D(nn.Module):
 
     def __init__(self, in_channels=1, embed_dim=96, depths=(2, 2, 6, 2),
                  num_heads=(3, 6, 12, 24), window_size=(2, 7, 7),
-                 patch_size=(2, 4, 4), mlp_ratio=4.0, drop_rate=0.0):
+                 patch_size=(2, 4, 4), mlp_ratio=4.0, drop_rate=0.0,
+                 input_size=None):
+        """
+        Args:
+            input_size: (D, H, W) target size for input downsampling.
+                        If None, no downsampling is applied.
+                        Use e.g. (20, 128, 128) to reduce memory for large inputs.
+        """
         super().__init__()
         self.num_stages = len(depths)
+        self.input_size = input_size
 
         # Patch embedding
         self.patch_embed = PatchEmbed3D(patch_size, in_channels, embed_dim)
@@ -534,6 +543,10 @@ class SwinTransformer3D(nn.Module):
 
     def forward_features(self, x):
         """Extract features, return [B, D', H', W', C] before final pool."""
+        # Downsample large inputs to reduce memory
+        if self.input_size is not None:
+            x = nn.functional.interpolate(
+                x, size=self.input_size, mode='trilinear', align_corners=False)
         x, D, H, W = self.patch_embed(x)  # [B, D'*H'*W', C]
         for stage in self.stages:
             x, D, H, W = stage(x, D, H, W)
@@ -560,6 +573,112 @@ class SwinTransformer3D(nn.Module):
 
 
 # ==============================================================================
+# Pretrained weight loading
+# ==============================================================================
+
+PRETRAIN_REPO_ROOT = "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shoulder_pretrain_repos"
+
+DEFAULT_PRETRAIN_PATHS = {
+    "resnet10": os.path.join(PRETRAIN_REPO_ROOT, "MedicalNet/pretrain/resnet_10_23dataset.pth"),
+    "resnet18": os.path.join(PRETRAIN_REPO_ROOT, "MedicalNet/pretrain/resnet_18_23dataset.pth"),
+    "resnet34": os.path.join(PRETRAIN_REPO_ROOT, "MedicalNet/pretrain/resnet_34_23dataset.pth"),
+    "resnet50": os.path.join(PRETRAIN_REPO_ROOT, "MedicalNet/pretrain/resnet_50_23dataset.pth"),
+    "resnet101": os.path.join(PRETRAIN_REPO_ROOT, "MedicalNet/pretrain/resnet_101.pth"),
+    "resnet152": os.path.join(PRETRAIN_REPO_ROOT, "MedicalNet/pretrain/resnet_152.pth"),
+    "swin3d_tiny": os.path.join(PRETRAIN_REPO_ROOT, "Video-Swin-Transformer/checkpoints/swin_tiny_patch244_window877_kinetics400_1k.pth"),
+    "swin_tiny": os.path.join(PRETRAIN_REPO_ROOT, "Video-Swin-Transformer/checkpoints/swin_tiny_patch244_window877_kinetics400_1k.pth"),
+}
+
+
+def _unwrap_checkpoint(checkpoint):
+    if isinstance(checkpoint, dict):
+        for key in ("state_dict", "model_state_dict", "model", "net"):
+            value = checkpoint.get(key)
+            if isinstance(value, dict):
+                return value
+    return checkpoint
+
+
+def _normalize_pretrained_key(key):
+    prefixes = ("module.", "backbone.", "encoder.", "swinViT.")
+    changed = True
+    while changed:
+        changed = False
+        for prefix in prefixes:
+            if key.startswith(prefix):
+                key = key[len(prefix):]
+                changed = True
+    # MONAI SwinViT: layers1.0.xxx -> stages.0.xxx (strip the extra .0. ModuleList index)
+    import re as _re
+    key = _re.sub(r'\blayers(\d+)\.0\.', lambda m: "stages.%d." % (int(m.group(1)) - 1), key)
+    key = key.replace("layers.", "stages.")
+    key = key.replace(".attn.w_msa.", ".attn.")
+    key = key.replace(".mlp.fc1.", ".mlp.0.")
+    key = key.replace(".mlp.fc2.", ".mlp.3.")
+    return key
+
+
+def _adapt_input_conv(weight, target_shape):
+    if len(weight.shape) != 5 or len(target_shape) != 5:
+        return weight
+    if weight.shape[0] != target_shape[0] or weight.shape[2:] != target_shape[2:]:
+        return weight
+    if weight.shape[1] == target_shape[1]:
+        return weight
+    if target_shape[1] == 1 and weight.shape[1] > 1:
+        return weight.mean(dim=1, keepdim=True)
+    if weight.shape[1] == 1 and target_shape[1] > 1:
+        return weight.repeat(1, target_shape[1], 1, 1, 1) / float(target_shape[1])
+    return weight
+
+
+def load_pretrained_weights(model, checkpoint_path, strict=False, verbose=True):
+    if not checkpoint_path:
+        return {"loaded": 0, "skipped": 0, "path": checkpoint_path}
+    if not os.path.exists(checkpoint_path):
+        raise FileNotFoundError("Pretrained checkpoint not found: %s" % checkpoint_path)
+
+    checkpoint = torch.load(checkpoint_path, map_location="cpu")
+    pretrained_state = _unwrap_checkpoint(checkpoint)
+    if not isinstance(pretrained_state, dict):
+        raise ValueError("Unsupported checkpoint format: %s" % checkpoint_path)
+
+    model_state = model.state_dict()
+    matched = {}
+    skipped = []
+    for raw_key, value in pretrained_state.items():
+        key = _normalize_pretrained_key(raw_key)
+        if key not in model_state:
+            skipped.append(raw_key)
+            continue
+        target = model_state[key]
+        if hasattr(value, "shape") and tuple(value.shape) != tuple(target.shape):
+            value = _adapt_input_conv(value, target.shape)
+        if hasattr(value, "shape") and tuple(value.shape) == tuple(target.shape):
+            matched[key] = value
+        else:
+            skipped.append(raw_key)
+
+    missing, unexpected = model.load_state_dict(matched, strict=False)
+    if strict and (missing or unexpected):
+        raise RuntimeError("Strict pretrained loading failed: missing=%d unexpected=%d" % (len(missing), len(unexpected)))
+    if verbose:
+        print("Loaded pretrained encoder weights from %s: matched=%d skipped=%d" % (
+            checkpoint_path, len(matched), len(skipped)))
+    return {"loaded": len(matched), "skipped": len(skipped), "path": checkpoint_path}
+
+
+def resolve_pretrained_path(name, pretrained_path=None):
+    if pretrained_path:
+        return pretrained_path
+    lname = name.lower()
+    for key, path in DEFAULT_PRETRAIN_PATHS.items():
+        if key in lname and os.path.exists(path):
+            return path
+    return None
+
+
+# ==============================================================================
 # Factory functions
 # ==============================================================================
 
@@ -578,6 +697,9 @@ def densenet3d_201(in_channels=1):
 def resnet3d_18(in_channels=1):
     return ResNet3D(BasicBlock3D, [2, 2, 2, 2], in_channels=in_channels)
 
+def resnet3d_34(in_channels=1):
+    return ResNet3D(BasicBlock3D, [3, 4, 6, 3], in_channels=in_channels)
+
 def resnet3d_50(in_channels=1):
     return ResNet3D(Bottleneck3D, [3, 4, 6, 3], in_channels=in_channels)
 
@@ -588,44 +710,72 @@ def resnet3d_152(in_channels=1):
     return ResNet3D(Bottleneck3D, [3, 8, 36, 3], in_channels=in_channels)
 
 
-def swin3d_tiny(in_channels=1):
+def swin3d_unetr(in_channels=1, input_size=(20, 128, 128)):
+    """SwinTransformer3D with MONAI SwinViT-compatible architecture.
+
+    embed_dim=48, patch_size=(2,2,2) matches model_swinvit.pt from Swin-UNETR
+    self-supervised pretraining.
+    """
+    return SwinTransformer3D(
+        in_channels=in_channels, embed_dim=48, depths=(2, 2, 2, 2),
+        num_heads=(3, 6, 12, 24), window_size=(7, 7, 7), patch_size=(2, 2, 2),
+        input_size=input_size)
+
+
+def swin3d_tiny(in_channels=1, input_size=(20, 128, 128)):
     return SwinTransformer3D(
         in_channels=in_channels, embed_dim=96, depths=(2, 2, 6, 2),
-        num_heads=(3, 6, 12, 24), window_size=(2, 7, 7), patch_size=(2, 4, 4))
+        num_heads=(3, 6, 12, 24), window_size=(2, 7, 7), patch_size=(2, 4, 4),
+        input_size=input_size)
 
-def swin3d_small(in_channels=1):
+def swin3d_small(in_channels=1, input_size=(20, 128, 128)):
     return SwinTransformer3D(
         in_channels=in_channels, embed_dim=96, depths=(2, 2, 18, 2),
-        num_heads=(3, 6, 12, 24), window_size=(2, 7, 7), patch_size=(2, 4, 4))
+        num_heads=(3, 6, 12, 24), window_size=(2, 7, 7), patch_size=(2, 4, 4),
+        input_size=input_size)
 
-def swin3d_base(in_channels=1):
+def swin3d_base(in_channels=1, input_size=(20, 128, 128)):
     return SwinTransformer3D(
         in_channels=in_channels, embed_dim=128, depths=(2, 2, 18, 2),
-        num_heads=(4, 8, 16, 32), window_size=(2, 7, 7), patch_size=(2, 4, 4))
+        num_heads=(4, 8, 16, 32), window_size=(2, 7, 7), patch_size=(2, 4, 4),
+        input_size=input_size)
 
 
-def get_encoder(name, in_channels=1):
+def get_encoder(name, in_channels=1, pretrained=False, pretrained_path=None):
     """Get encoder by name. Returns an encoder with forward/forward_slice/forward_pool."""
+    original_name = name
     name = name.lower()
     if "densenet201" in name:
-        return densenet3d_201(in_channels)
+        model = densenet3d_201(in_channels)
     elif "densenet169" in name:
-        return densenet3d_169(in_channels)
+        model = densenet3d_169(in_channels)
     elif "densenet121" in name or "densenet" in name:
-        return densenet3d_121(in_channels)
+        model = densenet3d_121(in_channels)
     elif "resnet152" in name:
-        return resnet3d_152(in_channels)
+        model = resnet3d_152(in_channels)
     elif "resnet101" in name:
-        return resnet3d_101(in_channels)
+        model = resnet3d_101(in_channels)
     elif "resnet50" in name:
-        return resnet3d_50(in_channels)
+        model = resnet3d_50(in_channels)
+    elif "resnet34" in name:
+        model = resnet3d_34(in_channels)
     elif "resnet18" in name or "resnet3d" in name:
-        return resnet3d_18(in_channels)
+        model = resnet3d_18(in_channels)
+    elif "swin3d_unetr" in name or "swinunetr" in name:
+        model = swin3d_unetr(in_channels)
     elif "swin3d_base" in name or "swin_base" in name:
-        return swin3d_base(in_channels)
+        model = swin3d_base(in_channels)
     elif "swin3d_small" in name or "swin_small" in name:
-        return swin3d_small(in_channels)
+        model = swin3d_small(in_channels)
     elif "swin3d_tiny" in name or "swin_tiny" in name or "swin3d" in name or "swin" in name:
-        return swin3d_tiny(in_channels)
+        model = swin3d_tiny(in_channels)
     else:
         raise ValueError("Unknown encoder: %s" % name)
+
+    if pretrained:
+        resolved_path = resolve_pretrained_path(original_name, pretrained_path)
+        if resolved_path:
+            load_pretrained_weights(model, resolved_path)
+        else:
+            print("Pretrained requested for %s but no compatible checkpoint was found; using random init." % original_name)
+    return model

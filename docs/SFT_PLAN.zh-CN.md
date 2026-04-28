@@ -46,10 +46,23 @@ MRI [B, 5, 1, Z, H, W]
 
 ### Backbone 选择
 
-Swin3D-Tiny 是 grounded 主线的唯一选择：
+**Swin3D-Tiny 是当前最适合作为可解释定位与 Qwen SFT 主线的前端**：
 - D' = 10（保留 slice 维度，可做 local token 提取）
 - 已训练 SliceHead localizer（±1 命中率 97.7%）
-- ResNet50 的 D' ≈ 1，无法支撑 slice-level grounding
+- ResNet18/34/50 的 D' ≈ 1-2（conv1/maxpool/layer2/3/4 均压缩 Z 维），定位粒度过粗
+
+**MedicalNet ResNet18/34 的定位**（作为对照，不作 grounding 主线）：
+- 优势：医学预训练，分类 AUC 0.744/0.747，明显优于从头训练的 Swin
+- 局限：D' ≈ 1-2，local_tokens 退化为"粗局部/分支 token"，无法支撑 slice-level grounding
+- 用途：**分类性能上限参考 / 迁移学习有效性对照 / 非定位 SFT baseline**
+- **KS ±1 指标对 D'=1-2 不可信**（总共只有 1-2 个 feature slice，±1 几乎覆盖全范围）；对这类 backbone 更可信的是 KS top1 + 可视化检查
+
+**三条并行线最终定位**：
+```
+MedicalNet ResNet18/34 G2L  = 分类性能与迁移学习对照
+Swin3D-Tiny G3 grounded     = 可解释定位与 Qwen SFT 主线
+CoPAS                       = 多序列融合对照，后续可吸收其 attention 机制到 grounded 主线
+```
 
 ---
 

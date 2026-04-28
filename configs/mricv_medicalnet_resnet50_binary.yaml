@@ -1,73 +1,51 @@
-# G3L: Swin Transformer 3D + localizer binary classification
-# A6 in experiment plan
+# MRI-CV screening: MedicalNet ResNet50 3D pretrained on 23 medical datasets
 
-# Data config
 data:
   data_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
   json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
   nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
-
   use_cache: true
-  cache_mode: loc
-  cache_root: outputs/cache_loc
-
+  cache_mode: cls
+  cache_root: outputs_clean/cache_cls
   sequences:
     - axial_PD
     - coronal_PD
     - coronal_T2WI
     - sagittal_PD
     - sagittal_T1WI
+  diseases: [SST, IST, SSC, LHBT, IGHL, RIPI, GHOA]
 
-  diseases:
-    - SST
-    - IST
-    - SSC
-    - LHBT
-    - IGHL
-    - RIPI
-    - GHOA
-
-# Model config
 model:
-  name: "swin_copas_binary_localizer"
-  encoder: "swin3d_tiny"
-  pretrained: false
-
+  name: "mricv_medicalnet_resnet50_binary"
+  encoder: "resnet50"
+  pretrained: true
+  pretrained_path: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shoulder_pretrain_repos/MedicalNet/pretrain/resnet_50_23dataset.pth"
   input_spacing: [1.0, 1.0, 1.0]
   crop_size: [96, 96, 64]
-
-  use_localizer: true
+  use_localizer: false
   localizer_mode: "key_slice"
 
-# Training config
 training:
   num_classes: 2
-
   batch_size: 8
   num_workers: 0
-  max_epochs: 50
+  max_epochs: 30
   learning_rate: 0.0001
-
   optimizer: "adam"
   weight_decay: 0.0001
   scheduler: "cosine"
-  warmup_epochs: 5
-
+  warmup_epochs: 3
   loss: "bce"
+  branch_alpha: 0.3
+  patience: 6
+  use_amp: true
 
-  patience: 15
-  dropout: 0.3
-
-  localizer_alpha: 0.2
-
-# Validation config
 validation:
   val_interval: 1
   save_best: true
 
-# Output config
 output:
-  exp_name: "g3l_swin_binary"
-  output_dir: "outputs/experiments"
+  exp_name: "mricv_medicalnet_resnet50_binary"
+  output_dir: "outputs_clean/experiments"
   save_tokens: true
   tokens_dir: "outputs/tokens"

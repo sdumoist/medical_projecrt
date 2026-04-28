@@ -20,6 +20,8 @@ __pycache__/
 # Outputs (keep structure, ignore heavy files)
 outputs/experiments/*/
 outputs/tokens/
+outputs/sft_data/
+outputs_clean/
 
 # IDE / OS
 .vscode/

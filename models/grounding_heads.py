@@ -95,7 +95,8 @@ class DiseaseSpecificSliceHeads(nn.Module):
         sag_logits = self.sag_slice_head(sag_pd_slice)  # [B, 1, D']
 
         # Assemble into canonical [B, 7, D'] order
-        slice_logits = cor_pd_slice.new_zeros(B, NUM_DISEASES, D)
+        # Use dtype from actual head output (handles AMP bf16/fp32 mismatch)
+        slice_logits = cor_logits.new_zeros(B, NUM_DISEASES, D)
         slice_logits[:, self.cor_indices] = cor_logits
         slice_logits[:, self.axi_indices] = axi_logits
         slice_logits[:, self.sag_indices] = sag_logits

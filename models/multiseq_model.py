@@ -75,6 +75,7 @@ class ShoulderCoPASModel(nn.Module):
         branch_alpha=0.3,
         use_localizer=False,
         num_classes=2,
+        **kwargs,
     ):
         super().__init__()
         self.num_diseases = num_diseases
@@ -85,7 +86,12 @@ class ShoulderCoPASModel(nn.Module):
         # --- 5 independent encoders (one per sequence) ---
         self.encoders = nn.ModuleDict()
         for seq_name in SEQ_INDEX:
-            self.encoders[seq_name] = get_encoder(encoder_name, in_channels=1)
+            self.encoders[seq_name] = get_encoder(
+                encoder_name,
+                in_channels=1,
+                pretrained=pretrained,
+                pretrained_path=kwargs.get("pretrained_path"),
+            )
 
         # Infer feature dim from encoder
         feat_dim = self.encoders['axial_PD'].num_features
@@ -220,4 +226,5 @@ def create_model(encoder="resnet3d_18", num_diseases=7, pretrained=False,
         branch_alpha=branch_alpha,
         use_localizer=use_localizer,
         num_classes=num_classes,
+        **kwargs,
     )

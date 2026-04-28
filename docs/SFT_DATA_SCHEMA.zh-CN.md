@@ -82,9 +82,10 @@
       "sagittal_PD",
       "sagittal_T1WI"
     ],
-    "cls_cache_path": "outputs/cache_cls/MR202511100183.pt",
-    "loc_cache_path": "outputs/cache_loc/MR202511100183.pt"
+    "cls_cache_path": "outputs_clean/cache_cls/MR202511100183.pt",
+    "loc_cache_path": "outputs_clean/cache_loc/MR202511100183.pt"
   },
+  "_cache_note": "cache_loc .pt 中存储的是 image/mask/key_slices/roi_boxes/spatial_meta，**不存 labels**。labels 在运行时由 ShoulderCacheDataset 根据 metadata_master.csv + LabelMapper 动态生成。",
   "targets": {},
   "output_text": "...",
   "train_policy": {
@@ -302,10 +303,15 @@
 
 ### 典型命令
 
+> **重要**：`outputs_clean/` 下的 cache/metadata 已在构建时完成 clean 过滤
+> （quality_flag != low, postoperative != 1, exclude_from_main_training != 1, raw_labels 仅含 0/1）。
+> 因此 `build_sft_jsonl.py` 的 `--metadata_csv` 应指向 `outputs_clean/metadata/`，
+> 而不是原始 `outputs/metadata/`，这样过滤已在上游完成，此处无需重复处理。
+
 ```bash
 python scripts/build_sft_jsonl.py \
-  --output_dir outputs/sft_data \
-  --metadata_csv outputs/metadata/metadata_master.csv \
+  --output_dir outputs_clean/sft_data \
+  --metadata_csv outputs_clean/metadata/metadata_master.csv \
   --min_quality medium
 ```
 
@@ -313,9 +319,9 @@ python scripts/build_sft_jsonl.py \
 
 ```bash
 python scripts/build_sft_jsonl.py \
-  --output_dir outputs/sft_data \
-  --metadata_csv outputs/metadata/metadata_master.csv \
-  --loc_index outputs/cache_loc/cache_loc_index.csv \
+  --output_dir outputs_clean/sft_data \
+  --metadata_csv outputs_clean/metadata/metadata_master.csv \
+  --loc_index outputs_clean/cache_loc/cache_loc_index.csv \
   --min_quality medium
 ```
 

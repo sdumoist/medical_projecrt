@@ -7,11 +7,16 @@ import torch.nn.functional as F
 
 
 class MaskedBCEWithLogitsLoss(nn.Module):
-    """Binary cross-entropy loss with mask support."""
+    """Binary cross-entropy loss with mask support and optional per-disease pos_weight."""
 
-    def __init__(self, reduction: str = "mean"):
+    def __init__(self, reduction: str = "mean", pos_weight: torch.Tensor = None):
         super().__init__()
         self.reduction = reduction
+        # pos_weight: [num_diseases] tensor, registered as buffer so it moves with .to(device)
+        if pos_weight is not None:
+            self.register_buffer('pos_weight', pos_weight)
+        else:
+            self.pos_weight = None
 
     def forward(self, logits: torch.Tensor, targets: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
         """
@@ -22,7 +27,8 @@ class MaskedBCEWithLogitsLoss(nn.Module):
         """
         # Compute BCE (targets must be float)
         targets = targets.float()
-        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none")
+        pw = self.pos_weight.to(logits.device) if self.pos_weight is not None else None
+        loss = F.binary_cross_entropy_with_logits(logits, targets, reduction="none", pos_weight=pw)
 
         if mask is not None:
             # Apply mask
