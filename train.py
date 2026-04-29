@@ -244,10 +244,10 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             mode="val",
         )
 
-    # DDP: only train_loader uses DistributedSampler.
-    # val_loader always uses the full val_dataset on every rank (rank 0 runs it,
-    # others skip via barrier), so no DistributedSampler for val.
+    # DDP: both train and val use DistributedSampler so all ranks participate
+    # equally. Val predictions are gathered via all_gather_object after the epoch.
     train_sampler = DistributedSampler(train_dataset, shuffle=True) if is_ddp else None
+    val_sampler   = DistributedSampler(val_dataset,   shuffle=False, drop_last=False) if is_ddp else None
 
     pw = num_workers > 0
     train_loader = DataLoader(
@@ -265,10 +265,10 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
         val_dataset,
         batch_size=batch_size,
         shuffle=False,
-        sampler=None,           # no DistributedSampler: full set on rank 0
+        sampler=val_sampler,
         num_workers=num_workers,
         pin_memory=True,
-        drop_last=False,        # must be False for val (no sample loss)
+        drop_last=False,
         persistent_workers=pw,
         prefetch_factor=2 if pw else None,
     )
@@ -480,6 +480,80 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
         ks_metrics = compute_key_slice_metrics(pred_slices, gt_slices, slice_valid, DISEASES)
         metrics['key_slice'] = ks_metrics
 
+    # Stash raw arrays so ddp_gather_val_metrics can all_gather them across ranks
+    if mode == 'val':
+        metrics['_raw'] = {
+            'probs':       all_probs,
+            'labels':      all_labels,
+            'masks':       all_masks,
+            'pred_slices': np.concatenate(all_pred_slices, axis=0) if all_pred_slices else np.array([]),
+            'gt_slices':   np.concatenate(all_gt_slices,   axis=0) if all_gt_slices   else np.array([]),
+            'slice_valid': np.concatenate(all_slice_valid, axis=0) if all_slice_valid  else np.array([]),
+            'losses':      {k: total_losses[k] / max(num_batches, 1) for k in total_losses},
+        }
+
+    return metrics
+
+
+def ddp_gather_val_metrics(local_metrics, device, is_ddp,
+                           use_localizer, is_binary, num_classes):
+    """Gather per-rank val raw arrays via all_gather_object, recompute metrics on rank 0.
+
+    local_metrics must contain '_raw' key (set by train_epoch when mode='val'):
+        _raw: {probs, labels, masks, pred_slices, gt_slices, slice_valid, losses}
+    Returns full-dataset metrics on rank 0; None on other ranks.
+    """
+    if not is_ddp:
+        # Single GPU: metrics are already complete
+        local_metrics.pop('_raw', None)
+        return local_metrics
+
+    raw = local_metrics.get('_raw', {})
+
+    # Gather raw arrays from all ranks
+    gathered = [None] * dist.get_world_size()
+    dist.all_gather_object(gathered, raw)
+
+    if not is_main_process():
+        return None
+
+    # Concatenate across ranks
+    def cat(key):
+        arrs = [g[key] for g in gathered if g and key in g]
+        return np.concatenate(arrs, axis=0) if arrs else np.array([])
+
+    all_probs   = cat('probs')
+    all_labels  = cat('labels')
+    all_masks   = cat('masks')
+    all_preds   = (all_probs > 0.5).astype(int) if is_binary else all_probs.argmax(axis=-1)
+
+    metrics = compute_per_disease_metrics(
+        all_labels, all_preds, DISEASES,
+        binary=is_binary,
+        y_prob_all=all_probs,
+        mask_all=all_masks,
+    )
+
+    # Average losses across ranks
+    losses = {}
+    for g in gathered:
+        if g and 'losses' in g:
+            for k, v in g['losses'].items():
+                losses[k] = losses.get(k, 0.0) + v
+    world = dist.get_world_size()
+    for k in losses:
+        metrics['loss_' + k] = losses[k] / world
+    metrics['loss'] = metrics.get('loss_total', 0.0)
+
+    # Key-slice metrics
+    pred_slices_all = cat('pred_slices')
+    gt_slices_all   = cat('gt_slices')
+    sv_all          = cat('slice_valid')
+    if use_localizer and pred_slices_all.size and gt_slices_all.size:
+        from utils.metrics import compute_key_slice_metrics
+        metrics['key_slice'] = compute_key_slice_metrics(
+            pred_slices_all, gt_slices_all, sv_all, DISEASES)
+
     return metrics
 
 
@@ -601,206 +675,203 @@ def train(config, output_dir):
             num_classes=num_classes, scaler=scaler, amp_dtype=amp_dtype)
 
         if (epoch + 1) % config['validation']['val_interval'] == 0:
-            # ── Validation: only rank 0 runs full val set ──────────────────
-            # Non-rank-0 processes wait at a barrier while rank 0 validates.
-            # This guarantees metrics come from the complete val set.
-            if is_ddp and not is_main_process():
-                dist.barrier()  # wait for rank 0 to finish val
-            else:
-                # Use raw model (not DDP-wrapped) to avoid triggering all_reduce during val
-                raw_model = model.module if is_ddp else model
-                val_metrics = train_epoch(
-                    raw_model, val_loader, optimizer, criterion, device, branch_alpha,
-                    "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
-                    num_classes=num_classes, scaler=None, amp_dtype=amp_dtype)
-                if is_ddp:
-                    dist.barrier()  # signal other ranks that val is done
+            # ── Validation: ALL ranks run val subset (via DistributedSampler) ──
+            # Then all_gather_object merges predictions; rank 0 computes metrics.
+            # This avoids long barrier waits that cause NCCL watchdog timeouts.
+            raw_model = model.module if is_ddp else model
+            local_val = train_epoch(
+                raw_model, val_loader, optimizer, criterion, device, branch_alpha,
+                "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
+                num_classes=num_classes, scaler=None, amp_dtype=amp_dtype)
 
-            # ── After barrier: only rank 0 computes metrics and decides stop ─
-            if not is_main_process():
-                # Receive early-stop decision broadcast from rank 0
-                stop_tensor = torch.zeros(1, dtype=torch.int32, device=device)
-                dist.broadcast(stop_tensor, src=0)
-                if stop_tensor.item() == 1:
-                    break
-                scheduler.step()
-                continue
+            # Gather across ranks; returns full metrics on rank 0, None elsewhere
+            val_metrics = ddp_gather_val_metrics(
+                local_val, device, is_ddp, use_localizer,
+                is_binary=(num_classes == 2), num_classes=num_classes)
 
-            # --- Macro averages (rank 0 only) ---
-            train_macro = summarize_macro_metrics(train_metrics)
-            val_macro = summarize_macro_metrics(val_metrics)
+            # ── Early-stop decision: rank 0 decides, broadcasts to all ranks ──
+            if is_main_process():
+                train_macro = summarize_macro_metrics(train_metrics)
+                val_macro = summarize_macro_metrics(val_metrics)
 
-            avg_f1 = val_macro['avg_f1']
-            cur_metric = val_macro['avg_opt_f1']   # early-stop / best-model on opt_f1
-            is_best = cur_metric > best_metric
+                avg_f1 = val_macro['avg_f1']
+                cur_metric = val_macro['avg_opt_f1']   # early-stop / best-model on opt_f1
+                is_best = cur_metric > best_metric
 
-            # --- Print losses (rank 0 only) ---
-            print("Epoch %d/%d" % (epoch + 1, epochs))
-            loss_str = "  Train Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f" % (
-                train_metrics['loss'], train_metrics['loss_final'],
-                train_metrics['loss_sag'], train_metrics['loss_cor'],
-                train_metrics['loss_axi'])
-            if use_localizer:
-                loss_str += " loc=%.4f" % train_metrics.get('loss_localizer', 0)
-            loss_str += ")"
-            print(loss_str)
+                # --- Print losses (rank 0 only) ---
+                print("Epoch %d/%d" % (epoch + 1, epochs))
+                loss_str = "  Train Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f" % (
+                    train_metrics['loss'], train_metrics['loss_final'],
+                    train_metrics['loss_sag'], train_metrics['loss_cor'],
+                    train_metrics['loss_axi'])
+                if use_localizer:
+                    loss_str += " loc=%.4f" % train_metrics.get('loss_localizer', 0)
+                loss_str += ")"
+                print(loss_str)
 
-            loss_str = "  Val   Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f" % (
-                val_metrics['loss'], val_metrics['loss_final'],
-                val_metrics['loss_sag'], val_metrics['loss_cor'],
-                val_metrics['loss_axi'])
-            if use_localizer:
-                loss_str += " loc=%.4f" % val_metrics.get('loss_localizer', 0)
-            loss_str += ")"
-            print(loss_str)
+                loss_str = "  Val   Loss: %.4f (final=%.4f sag=%.4f cor=%.4f axi=%.4f" % (
+                    val_metrics['loss'], val_metrics['loss_final'],
+                    val_metrics['loss_sag'], val_metrics['loss_cor'],
+                    val_metrics['loss_axi'])
+                if use_localizer:
+                    loss_str += " loc=%.4f" % val_metrics.get('loss_localizer', 0)
+                loss_str += ")"
+                print(loss_str)
 
-            # --- Print per-disease metrics ---
-            print("  Per-disease metrics (val):")
-            print("    %-6s  %6s  %6s  %6s  %6s  %6s  %6s  %6s" % (
-                "", "F1", "AUC", "Recall", "Prec", "Acc", "OptF1", "OptThr"))
-            for disease in DISEASES:
-                dm = val_metrics.get(disease, {})
-                print("    %-6s  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f  %5.2f" % (
-                    disease,
-                    dm.get('f1', 0),
-                    dm.get('auc', 0),
-                    dm.get('recall', 0),
-                    dm.get('precision', 0),
-                    dm.get('accuracy', 0),
-                    dm.get('opt_f1', 0),
-                    dm.get('opt_thr', 0.5)))
+                # --- Print per-disease metrics ---
+                print("  Per-disease metrics (val):")
+                print("    %-6s  %6s  %6s  %6s  %6s  %6s  %6s  %6s" % (
+                    "", "F1", "AUC", "Recall", "Prec", "Acc", "OptF1", "OptThr"))
+                for disease in DISEASES:
+                    dm = val_metrics.get(disease, {})
+                    print("    %-6s  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f  %6.4f  %5.2f" % (
+                        disease,
+                        dm.get('f1', 0),
+                        dm.get('auc', 0),
+                        dm.get('recall', 0),
+                        dm.get('precision', 0),
+                        dm.get('accuracy', 0),
+                        dm.get('opt_f1', 0),
+                        dm.get('opt_thr', 0.5)))
 
-            print("  Avg F1: %.4f  AUC: %.4f  OptF1: %.4f  Recall: %.4f  Prec: %.4f  (best F1: %.4f)" % (
-                val_macro['avg_f1'], val_macro['avg_auc'], val_macro['avg_opt_f1'],
-                val_macro['avg_recall'], val_macro['avg_precision'], best_metric))
+                print("  Avg F1: %.4f  AUC: %.4f  OptF1: %.4f  Recall: %.4f  Prec: %.4f  (best F1: %.4f)" % (
+                    val_macro['avg_f1'], val_macro['avg_auc'], val_macro['avg_opt_f1'],
+                    val_macro['avg_recall'], val_macro['avg_precision'], best_metric))
 
-            # Print key-slice metrics if available
-            if 'key_slice' in val_metrics:
-                ks = val_metrics['key_slice']
-                print("  Key-slice: top1=%.4f  pm1=%.4f" % (
-                    ks.get('macro_ks_top1', 0), ks.get('macro_ks_pm1', 0)))
+                # Print key-slice metrics if available
+                if 'key_slice' in val_metrics:
+                    ks = val_metrics['key_slice']
+                    print("  Key-slice: top1=%.4f  pm1=%.4f" % (
+                        ks.get('macro_ks_top1', 0), ks.get('macro_ks_pm1', 0)))
 
-            # --- Save CSV row ---
-            csv_row = {
-                'epoch': epoch + 1,
-                'lr': cur_lr,
-                'train_loss': train_metrics['loss'],
-                'val_loss': val_metrics['loss'],
-                'train_avg_acc': train_macro['avg_accuracy'],
-                'train_avg_f1': train_macro['avg_f1'],
-                'train_avg_auc': train_macro['avg_auc'],
-                'train_avg_recall': train_macro['avg_recall'],
-                'train_avg_precision': train_macro['avg_precision'],
-                'train_avg_opt_f1': train_macro['avg_opt_f1'],
-                'val_avg_acc': val_macro['avg_accuracy'],
-                'val_avg_f1': val_macro['avg_f1'],
-                'val_avg_auc': val_macro['avg_auc'],
-                'val_avg_recall': val_macro['avg_recall'],
-                'val_avg_precision': val_macro['avg_precision'],
-                'val_avg_opt_f1': val_macro['avg_opt_f1'],
-                'best_avg_f1': max(best_metric, cur_metric),
-                'is_best': int(is_best),
-            }
-            # Per-disease val F1/AUC/opt in CSV
-            for d in DISEASES:
-                dm = val_metrics.get(d, {})
-                csv_row['%s_f1' % d] = dm.get('f1', 0)
-                csv_row['%s_auc' % d] = dm.get('auc', 0)
-                csv_row['%s_recall' % d] = dm.get('recall', 0)
-                csv_row['%s_precision' % d] = dm.get('precision', 0)
-                csv_row['%s_opt_f1' % d] = dm.get('opt_f1', 0)
-                csv_row['%s_opt_thr' % d] = dm.get('opt_thr', 0.5)
-            # Key-slice metrics in CSV
-            if 'key_slice' in val_metrics:
-                ks = val_metrics['key_slice']
-                csv_row['macro_ks_top1'] = ks.get('macro_ks_top1', 0)
-                csv_row['macro_ks_pm1'] = ks.get('macro_ks_pm1', 0)
-            save_epoch_metrics_csv(csv_path, csv_row)
+                # --- Save CSV row ---
+                csv_row = {
+                    'epoch': epoch + 1,
+                    'lr': cur_lr,
+                    'train_loss': train_metrics['loss'],
+                    'val_loss': val_metrics['loss'],
+                    'train_avg_acc': train_macro['avg_accuracy'],
+                    'train_avg_f1': train_macro['avg_f1'],
+                    'train_avg_auc': train_macro['avg_auc'],
+                    'train_avg_recall': train_macro['avg_recall'],
+                    'train_avg_precision': train_macro['avg_precision'],
+                    'train_avg_opt_f1': train_macro['avg_opt_f1'],
+                    'val_avg_acc': val_macro['avg_accuracy'],
+                    'val_avg_f1': val_macro['avg_f1'],
+                    'val_avg_auc': val_macro['avg_auc'],
+                    'val_avg_recall': val_macro['avg_recall'],
+                    'val_avg_precision': val_macro['avg_precision'],
+                    'val_avg_opt_f1': val_macro['avg_opt_f1'],
+                    'best_avg_f1': max(best_metric, cur_metric),
+                    'is_best': int(is_best),
+                }
+                for d in DISEASES:
+                    dm = val_metrics.get(d, {})
+                    csv_row['%s_f1' % d] = dm.get('f1', 0)
+                    csv_row['%s_auc' % d] = dm.get('auc', 0)
+                    csv_row['%s_recall' % d] = dm.get('recall', 0)
+                    csv_row['%s_precision' % d] = dm.get('precision', 0)
+                    csv_row['%s_opt_f1' % d] = dm.get('opt_f1', 0)
+                    csv_row['%s_opt_thr' % d] = dm.get('opt_thr', 0.5)
+                if 'key_slice' in val_metrics:
+                    ks = val_metrics['key_slice']
+                    csv_row['macro_ks_top1'] = ks.get('macro_ks_top1', 0)
+                    csv_row['macro_ks_pm1'] = ks.get('macro_ks_pm1', 0)
+                save_epoch_metrics_csv(csv_path, csv_row)
 
-            # --- Save JSONL record ---
-            jsonl_record = {
-                'epoch': epoch + 1,
-                'lr': cur_lr,
-                'train_loss': {k: train_metrics.get('loss_' + k, 0)
-                               for k in ['total', 'final', 'sag', 'cor', 'axi']},
-                'val_loss': {k: val_metrics.get('loss_' + k, 0)
-                             for k in ['total', 'final', 'sag', 'cor', 'axi']},
-                'train_macro': train_macro,
-                'val_macro': val_macro,
-                'train_per_disease': {d: train_metrics.get(d, {})
-                                      for d in DISEASES},
-                'val_per_disease': {d: val_metrics.get(d, {})
-                                    for d in DISEASES},
-                'best_avg_f1': max(best_metric, cur_metric),
-                'is_best': is_best,
-            }
-            if 'key_slice' in val_metrics:
-                jsonl_record['val_key_slice'] = val_metrics['key_slice']
-            if 'key_slice' in train_metrics:
-                jsonl_record['train_key_slice'] = train_metrics['key_slice']
-            save_epoch_metrics_jsonl(jsonl_path, jsonl_record)
+                # --- Save JSONL record ---
+                jsonl_record = {
+                    'epoch': epoch + 1,
+                    'lr': cur_lr,
+                    'train_loss': {k: train_metrics.get('loss_' + k, 0)
+                                   for k in ['total', 'final', 'sag', 'cor', 'axi']},
+                    'val_loss': {k: val_metrics.get('loss_' + k, 0)
+                                 for k in ['total', 'final', 'sag', 'cor', 'axi']},
+                    'train_macro': train_macro,
+                    'val_macro': val_macro,
+                    'train_per_disease': {d: train_metrics.get(d, {})
+                                          for d in DISEASES},
+                    'val_per_disease': {d: val_metrics.get(d, {})
+                                        for d in DISEASES},
+                    'best_avg_f1': max(best_metric, cur_metric),
+                    'is_best': is_best,
+                }
+                if 'key_slice' in val_metrics:
+                    jsonl_record['val_key_slice'] = val_metrics['key_slice']
+                if 'key_slice' in train_metrics:
+                    jsonl_record['train_key_slice'] = train_metrics['key_slice']
+                save_epoch_metrics_jsonl(jsonl_path, jsonl_record)
 
-            # --- Save last_model.pt (every epoch) ---
-            raw_model = model.module if hasattr(model, 'module') else model
-            last_path = os.path.join(output_dir, "last_model.pt")
-            torch.save({
-                'epoch': epoch,
-                'model_state_dict': raw_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'metrics': val_metrics,
-                'branch_alpha': branch_alpha,
-                'config': config,
-            }, last_path)
-
-            # --- Save best_model.pt ---
-            if is_best:
-                best_metric = cur_metric
-                save_path = os.path.join(output_dir, "best_model.pt")
+                # --- Save last_model.pt (every epoch) ---
+                raw_model_save = model.module if hasattr(model, 'module') else model
+                last_path = os.path.join(output_dir, "last_model.pt")
                 torch.save({
                     'epoch': epoch,
-                    'model_state_dict': raw_model.state_dict(),
+                    'model_state_dict': raw_model_save.state_dict(),
                     'optimizer_state_dict': optimizer.state_dict(),
                     'metrics': val_metrics,
                     'branch_alpha': branch_alpha,
                     'config': config,
-                }, save_path)
-                print("  Saved best model: %s" % save_path)
+                }, last_path)
 
-                # --- Save best_thresholds.json ---
-                thresholds = {}
-                for d in DISEASES:
-                    dm = val_metrics.get(d, {})
-                    thresholds[d] = {
-                        'opt_thr': dm.get('opt_thr', 0.5),
-                        'opt_f1': dm.get('opt_f1', 0),
-                        'opt_precision': dm.get('opt_precision', 0),
-                        'opt_recall': dm.get('opt_recall', 0),
-                        'auc': dm.get('auc', 0),
+                # --- Save best_model.pt ---
+                if is_best:
+                    best_metric = cur_metric
+                    save_path = os.path.join(output_dir, "best_model.pt")
+                    torch.save({
+                        'epoch': epoch,
+                        'model_state_dict': raw_model_save.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'metrics': val_metrics,
+                        'branch_alpha': branch_alpha,
+                        'config': config,
+                    }, save_path)
+                    print("  Saved best model: %s" % save_path)
+
+                    # --- Save best_thresholds.json ---
+                    thresholds = {}
+                    for d in DISEASES:
+                        dm = val_metrics.get(d, {})
+                        thresholds[d] = {
+                            'opt_thr': dm.get('opt_thr', 0.5),
+                            'opt_f1': dm.get('opt_f1', 0),
+                            'opt_precision': dm.get('opt_precision', 0),
+                            'opt_recall': dm.get('opt_recall', 0),
+                            'auc': dm.get('auc', 0),
+                        }
+                    thresholds['_meta'] = {
+                        'epoch': epoch + 1,
+                        'val_macro_auc': val_macro['avg_auc'],
+                        'val_macro_f1': val_macro['avg_f1'],
+                        'val_macro_opt_f1': val_macro['avg_opt_f1'],
                     }
-                thresholds['_meta'] = {
-                    'epoch': epoch + 1,
-                    'val_macro_auc': val_macro['avg_auc'],
-                    'val_macro_f1': val_macro['avg_f1'],
-                    'val_macro_opt_f1': val_macro['avg_opt_f1'],
-                }
-                thr_path = os.path.join(output_dir, "best_thresholds.json")
-                with open(thr_path, 'w') as f:
-                    json.dump(thresholds, f, indent=2)
-                print("  Saved best thresholds: %s" % thr_path)
-                patience_counter = 0
+                    thr_path = os.path.join(output_dir, "best_thresholds.json")
+                    with open(thr_path, 'w') as f:
+                        json.dump(thresholds, f, indent=2)
+                    print("  Saved best thresholds: %s" % thr_path)
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+
+                patience = config['training'].get('patience', 10)
+                should_stop = (patience_counter >= patience)
+                if should_stop:
+                    print("Early stopping at epoch %d" % (epoch + 1))
+
+                # Broadcast early-stop decision to all DDP ranks (unconditional)
+                if is_ddp:
+                    stop_tensor = torch.tensor([1 if should_stop else 0],
+                                               dtype=torch.int32, device=device)
+                    dist.broadcast(stop_tensor, src=0)
+
             else:
-                patience_counter += 1
-
-            patience = config['training'].get('patience', 10)
-            should_stop = (patience_counter >= patience)
-            if should_stop:
-                print("Early stopping at epoch %d" % (epoch + 1))
-
-            # Broadcast early-stop decision to all DDP ranks
-            if is_ddp:
-                stop_tensor = torch.tensor([1 if should_stop else 0],
-                                           dtype=torch.int32, device=device)
-                dist.broadcast(stop_tensor, src=0)
+                # Non-rank-0: always receive early-stop broadcast from rank 0
+                if is_ddp:
+                    stop_tensor = torch.zeros(1, dtype=torch.int32, device=device)
+                    dist.broadcast(stop_tensor, src=0)
+                    should_stop = stop_tensor.item() == 1
+                else:
+                    should_stop = False
 
             if should_stop:
                 break
