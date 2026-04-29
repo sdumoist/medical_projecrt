@@ -34,7 +34,10 @@ from functools import partial
 
 import torch
 import torch.nn as nn
+import torch.distributed as dist
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 PROJECT_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
 if PROJECT_ROOT not in sys.path:
@@ -68,14 +71,15 @@ def train_epoch(model, loader, optimizer, scheduler, device, epoch,
     """
     model.train()
     # Keep frozen MRI-CV in eval mode to avoid BatchNorm issues with bs=1
-    if model.mri_cv_frozen:
-        model.mri_cv.eval()
+    raw_model = model.module if hasattr(model, "module") else model
+    if raw_model.mri_cv_frozen:
+        raw_model.mri_cv.eval()
     else:
         # Stage 2: MRI-CV partially unfrozen, but still set eval for
         # frozen sub-modules to keep BatchNorm stable
-        model.mri_cv.eval()
+        raw_model.mri_cv.eval()
         # Then set only unfrozen sub-modules back to train
-        for name, module in model.mri_cv.named_modules():
+        for name, module in raw_model.mri_cv.named_modules():
             if any(p.requires_grad for p in module.parameters(recurse=False)):
                 module.train()
     total_loss = 0.0
@@ -175,7 +179,8 @@ def validate(model, loader, tokenizer, device, max_new_tokens=512):
         if num_steps % 10 == 1:
             # Build prompt-only input (mask output tokens)
             prompt_lens = batch["prompt_lens"]
-            num_vis = model.num_visual_tokens
+            raw_m = model.module if hasattr(model, "module") else model
+            num_vis = raw_m.num_visual_tokens
 
             for i in range(len(batch["exam_ids"])):
                 plen = prompt_lens[i] + num_vis
@@ -226,18 +231,31 @@ def validate(model, loader, tokenizer, device, max_new_tokens=512):
 def train(config, args):
     """Main training function."""
     stage = config.get("stage", 1)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    print("Stage: %d, Device: %s" % (stage, device))
+
+    # ── DDP initialisation ──
+    use_ddp = "LOCAL_RANK" in os.environ
+    local_rank = int(os.environ.get("LOCAL_RANK", 0))
+    if use_ddp:
+        dist.init_process_group(backend="nccl")
+        torch.cuda.set_device(local_rank)
+        device = torch.device("cuda", local_rank)
+        is_main = (local_rank == 0)
+    else:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        is_main = True
+
+    if is_main:
+        print("Stage: %d, Device: %s  DDP=%s" % (stage, device, use_ddp))
 
     # ── Output directory ──
     exp_name = config["output"]["exp_name"]
     output_dir = os.path.join(config["output"]["output_dir"], exp_name)
-    os.makedirs(output_dir, exist_ok=True)
-    print("Output: %s" % output_dir)
-
-    # Save resolved config
-    with open(os.path.join(output_dir, "config_resolved.yaml"), "w") as f:
-        yaml.safe_dump(config, f, default_flow_style=False)
+    if is_main:
+        os.makedirs(output_dir, exist_ok=True)
+        print("Output: %s" % output_dir)
+        # Save resolved config
+        with open(os.path.join(output_dir, "config_resolved.yaml"), "w") as f:
+            yaml.safe_dump(config, f, default_flow_style=False)
 
     # ── Load tokenizer ──
     from transformers import AutoTokenizer
@@ -250,12 +268,18 @@ def train(config, args):
 
     # ── Load MRI-CV model ──
     mri_cv_cfg = config["mri_cv"]
+    use_roi_tokens = config.get("projector", {}).get("use_roi_tokens", False)
+    use_roi_head   = mri_cv_cfg.get("use_roi_head", False)
+    if use_roi_tokens:
+        use_roi_head = True  # ROI tokens require roi_head in MRI-CV
+
     mri_cv = create_model(
         encoder=mri_cv_cfg["encoder"],
         num_diseases=7,
         pretrained=False,
         use_localizer=mri_cv_cfg.get("use_localizer", False),
         num_classes=2,
+        use_roi_head=use_roi_head,
     )
 
     ckpt_path = mri_cv_cfg.get("checkpoint_path")
@@ -264,8 +288,11 @@ def train(config, args):
             ckpt_path = os.path.join(PROJECT_ROOT, ckpt_path)
         if os.path.exists(ckpt_path):
             ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-            mri_cv.load_state_dict(ckpt["model_state_dict"], strict=False)
-            print("Loaded MRI-CV checkpoint: %s" % ckpt_path)
+            state = ckpt.get("model_state_dict", ckpt)
+            missing, unexpected = mri_cv.load_state_dict(state, strict=False)
+            if is_main:
+                print("Loaded MRI-CV checkpoint: %s (missing=%d unexpected=%d)"
+                      % (ckpt_path, len(missing), len(unexpected)))
         else:
             warnings.warn("MRI-CV checkpoint not found: %s" % ckpt_path)
 
@@ -305,28 +332,48 @@ def train(config, args):
         task_type="CAUSAL_LM",
     )
     llm = get_peft_model(llm, lora_config)
-    llm.print_trainable_parameters()
+    if is_main:
+        llm.print_trainable_parameters()
 
     # ── Assemble SFT model ──
     projector = VisualProjector(
         cv_dim=feat_dim, llm_dim=llm_dim, num_slots=num_visual_tokens)
-    model = ShoulderSFTModel(mri_cv, projector, llm, num_visual_tokens)
+    model = ShoulderSFTModel(
+        mri_cv, projector, llm,
+        num_visual_tokens=num_visual_tokens,
+        use_roi_tokens=use_roi_tokens,
+        cv_dim=feat_dim,
+        llm_dim=llm_dim,
+    )
     model = model.to(device)
 
     # Apply freeze strategy
     apply_freeze_strategy(model, stage, config)
 
+    # Wrap with DDP after freeze so only trainable params are in DDP
+    model_for_train = model
+    if use_ddp:
+        model_for_train = DDP(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=True)
+
     # ── Resume from checkpoint ──
     start_epoch = 0
     if args.resume:
         resume_path = args.resume
+        if not os.path.isabs(resume_path):
+            resume_path = os.path.join(PROJECT_ROOT, resume_path)
         if os.path.exists(resume_path):
             ckpt = torch.load(resume_path, map_location="cpu", weights_only=False)
-            model.projector.load_state_dict(ckpt.get("projector_state_dict", {}))
+            raw_model = model_for_train.module if use_ddp else model_for_train
+            raw_model.projector.load_state_dict(
+                ckpt.get("projector_state_dict", {}))
             if "lora_state_dict" in ckpt:
-                model.llm.load_state_dict(ckpt["lora_state_dict"], strict=False)
+                raw_model.llm.load_state_dict(
+                    ckpt["lora_state_dict"], strict=False)
             start_epoch = ckpt.get("epoch", 0) + 1
-            print("Resumed from %s (epoch %d)" % (resume_path, start_epoch))
+            if is_main:
+                print("Resumed from %s (epoch %d)" % (resume_path, start_epoch))
 
     # ── Data ──
     data_cfg = config["data"]
@@ -349,7 +396,8 @@ def train(config, args):
     # Limit samples for smoke test
     if args.max_samples > 0 and len(train_dataset.samples) > args.max_samples:
         train_dataset.samples = train_dataset.samples[:args.max_samples]
-        print("Smoke test: limited to %d training samples" % args.max_samples)
+        if is_main:
+            print("Smoke test: limited to %d training samples" % args.max_samples)
 
     val_jsonl = data_cfg.get("val_jsonl", [])
     val_dataset = None
@@ -370,10 +418,12 @@ def train(config, args):
                        pad_token_id=tokenizer.pad_token_id,
                        num_visual_tokens=num_visual_tokens)
 
+    train_sampler = DistributedSampler(train_dataset, shuffle=True) if use_ddp else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=train_cfg["batch_size"],
-        shuffle=True,
+        shuffle=(train_sampler is None),
+        sampler=train_sampler,
         num_workers=train_cfg.get("num_workers", 4),
         collate_fn=collate,
         pin_memory=True,
@@ -381,26 +431,28 @@ def train(config, args):
 
     val_loader = None
     if val_dataset:
+        val_sampler = DistributedSampler(val_dataset, shuffle=False) if use_ddp else None
         val_loader = DataLoader(
             val_dataset,
             batch_size=train_cfg["batch_size"],
             shuffle=False,
+            sampler=val_sampler,
             num_workers=train_cfg.get("num_workers", 4),
             collate_fn=collate,
             pin_memory=True,
         )
 
     # ── Optimizer ──
-    # Separate param groups for different LR
+    raw_model = model_for_train.module if use_ddp else model_for_train
     param_groups = []
     # Projector
     param_groups.append({
-        "params": [p for p in model.projector.parameters() if p.requires_grad],
+        "params": [p for p in raw_model.projector.parameters() if p.requires_grad],
         "lr": train_cfg["learning_rate"],
         "name": "projector",
     })
     # LoRA
-    lora_params = [p for n, p in model.llm.named_parameters() if p.requires_grad]
+    lora_params = [p for n, p in raw_model.llm.named_parameters() if p.requires_grad]
     if lora_params:
         param_groups.append({
             "params": lora_params,
@@ -408,7 +460,7 @@ def train(config, args):
             "name": "lora",
         })
     # MRI-CV unfrozen (Stage 2)
-    cv_params = [p for p in model.mri_cv.parameters() if p.requires_grad]
+    cv_params = [p for p in raw_model.mri_cv.parameters() if p.requires_grad]
     if cv_params:
         cv_lr_mult = config.get("mri_cv", {}).get("lr_multiplier", 0.1)
         param_groups.append({
@@ -440,72 +492,85 @@ def train(config, args):
     jsonl_path = os.path.join(output_dir, "metrics_epoch.jsonl")
     grad_accum_steps = train_cfg.get("gradient_accumulation_steps", 1)
     keyslice_alpha = train_cfg.get("keyslice_alpha", 0.0)
-    print("Gradient accumulation steps: %d (effective batch = %d)" % (
-        grad_accum_steps, train_cfg["batch_size"] * grad_accum_steps))
-    if keyslice_alpha > 0:
-        print("Key-slice loss weight: %.2f (Stage 2)" % keyslice_alpha)
+    if is_main:
+        print("Gradient accumulation steps: %d (effective batch = %d)" % (
+            grad_accum_steps, train_cfg["batch_size"] * grad_accum_steps))
+        if keyslice_alpha > 0:
+            print("Key-slice loss weight: %.2f (Stage 2)" % keyslice_alpha)
 
     for epoch in range(start_epoch, train_cfg["max_epochs"]):
-        print("\n[Epoch %d/%d]" % (epoch + 1, train_cfg["max_epochs"]))
+        if use_ddp and train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        if is_main:
+            print("\n[Epoch %d/%d]" % (epoch + 1, train_cfg["max_epochs"]))
 
         train_metrics = train_epoch(
-            model, train_loader, optimizer, scheduler, device, epoch,
+            model_for_train, train_loader, optimizer, scheduler, device, epoch,
             max_grad_norm=train_cfg.get("max_grad_norm", 1.0),
             grad_accum_steps=grad_accum_steps,
             keyslice_alpha=keyslice_alpha)
 
-        print("  Train loss: %.4f (steps: %d)" % (
-            train_metrics["loss"], train_metrics["steps"]))
+        if is_main:
+            print("  Train loss: %.4f (steps: %d)" % (
+                train_metrics["loss"], train_metrics["steps"]))
 
-        # Validation
+        # Validation (run on all ranks, only main rank logs/saves)
         val_metrics = None
         val_interval = config.get("validation", {}).get("val_interval", 1)
         if val_loader and (epoch + 1) % val_interval == 0:
             gen_max = config.get("validation", {}).get(
                 "generation_max_length", 512)
+            # Unwrap DDP for generation
+            eval_model = model_for_train.module if use_ddp else model_for_train
             val_metrics = validate(
-                model, val_loader, tokenizer, device,
+                eval_model, val_loader, tokenizer, device,
                 max_new_tokens=gen_max)
 
-            print("  Val loss: %.4f  (eval samples: %d)" % (
-                val_metrics["loss"], val_metrics["num_eval_samples"]))
+            if is_main:
+                print("  Val loss: %.4f  (eval samples: %d)" % (
+                    val_metrics["loss"], val_metrics["num_eval_samples"]))
 
-            for task, tm in val_metrics.get("task_metrics", {}).items():
-                parts = ["  %s:" % task]
-                for k, v in sorted(tm.items()):
-                    parts.append("%s=%.3f" % (k, v))
-                print(" ".join(parts))
+                for task, tm in val_metrics.get("task_metrics", {}).items():
+                    parts = ["  %s:" % task]
+                    for k, v in sorted(tm.items()):
+                        parts.append("%s=%.3f" % (k, v))
+                    print(" ".join(parts))
 
             is_best = val_metrics["loss"] < best_val_loss
         else:
             is_best = False
 
-        # Save metrics JSONL
-        record = {
-            "epoch": epoch + 1,
-            "train_loss": train_metrics["loss"],
-        }
-        if val_metrics:
-            record["val_loss"] = val_metrics["loss"]
-            record["val_task_metrics"] = val_metrics.get("task_metrics", {})
-            record["is_best"] = is_best
-        with open(jsonl_path, "a") as f:
-            f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        if is_main:
+            # Save metrics JSONL
+            record = {
+                "epoch": epoch + 1,
+                "train_loss": train_metrics["loss"],
+            }
+            if val_metrics:
+                record["val_loss"] = val_metrics["loss"]
+                record["val_task_metrics"] = val_metrics.get("task_metrics", {})
+                record["is_best"] = is_best
+            with open(jsonl_path, "a") as f:
+                f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
-        # Save last checkpoint
-        _save_checkpoint(model, optimizer, epoch, train_metrics,
-                          os.path.join(output_dir, "last_checkpoint.pt"),
-                          config)
-
-        # Save best checkpoint
-        if val_metrics and is_best:
-            best_val_loss = val_metrics["loss"]
-            _save_checkpoint(model, optimizer, epoch, val_metrics,
-                              os.path.join(output_dir, "best_checkpoint.pt"),
+            # Save last checkpoint
+            raw_m = model_for_train.module if use_ddp else model_for_train
+            _save_checkpoint(raw_m, optimizer, epoch, train_metrics,
+                              os.path.join(output_dir, "last_checkpoint.pt"),
                               config)
-            print("  Saved best checkpoint (val_loss=%.4f)" % best_val_loss)
 
-    print("\nTraining complete! Best val loss: %.4f" % best_val_loss)
+            # Save best checkpoint
+            if val_metrics and is_best:
+                best_val_loss = val_metrics["loss"]
+                _save_checkpoint(raw_m, optimizer, epoch, val_metrics,
+                                  os.path.join(output_dir, "best_checkpoint.pt"),
+                                  config)
+                print("  Saved best checkpoint (val_loss=%.4f)" % best_val_loss)
+
+    if use_ddp:
+        dist.destroy_process_group()
+    if is_main:
+        print("\nTraining complete! Best val loss: %.4f" % best_val_loss)
 
 
 def _save_checkpoint(model, optimizer, epoch, metrics, path, config):

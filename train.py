@@ -201,6 +201,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             load_dense_masks=load_dense_masks,
             load_roi_targets=load_roi_targets,
             grounding_target_path=grounding_target_path,
+            mask_output_size=tuple(config['model'].get('mask_output_size', [56, 56])),
         )
         val_dataset = ShoulderCacheDataset(
             cache_root=cache_root,
@@ -212,6 +213,7 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             load_dense_masks=load_dense_masks,
             load_roi_targets=load_roi_targets,
             grounding_target_path=grounding_target_path,
+            mask_output_size=tuple(config['model'].get('mask_output_size', [56, 56])),
         )
     else:
         # Raw NIfTI mode
@@ -402,6 +404,7 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
     all_pred_slices = []
     all_gt_slices = []
     all_slice_valid = []
+    all_exam_ids = []   # for DDP val deduplication
     num_batches = 0
 
     try:
@@ -484,6 +487,10 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
             all_labels.append(labels.float().cpu().numpy())
             all_masks.append(mask_labels.float().cpu().numpy())
 
+            # Collect exam_ids for DDP deduplication
+            if "exam_id" in batch:
+                all_exam_ids.extend(batch["exam_id"])
+
             # Collect localizer slice predictions for metrics
             # NOTE: pred_slice_idx is in D' (feature) space.
             #       gt key_slices are in Z (input) space.
@@ -533,6 +540,7 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
     # Stash raw arrays so ddp_gather_val_metrics can all_gather them across ranks
     if mode == 'val':
         metrics['_raw'] = {
+            'exam_ids':    all_exam_ids,
             'probs':       all_probs,
             'labels':      all_labels,
             'masks':       all_masks,
@@ -572,9 +580,28 @@ def ddp_gather_val_metrics(local_metrics, device, is_ddp,
         arrs = [g[key] for g in gathered if g and key in g]
         return np.concatenate(arrs, axis=0) if arrs else np.array([])
 
+    all_exam_ids_gathered = []
+    for g in gathered:
+        if g and 'exam_ids' in g:
+            all_exam_ids_gathered.extend(g['exam_ids'])
+
     all_probs   = cat('probs')
     all_labels  = cat('labels')
     all_masks   = cat('masks')
+
+    # Deduplicate by exam_id: DistributedSampler may pad the last batch,
+    # causing the last few samples to appear on multiple ranks.
+    if all_exam_ids_gathered and len(all_exam_ids_gathered) == len(all_probs):
+        seen = set()
+        keep = []
+        for i, eid in enumerate(all_exam_ids_gathered):
+            if eid not in seen:
+                seen.add(eid)
+                keep.append(i)
+        keep = np.array(keep)
+        all_probs  = all_probs[keep]
+        all_labels = all_labels[keep]
+        all_masks  = all_masks[keep]
     all_preds   = (all_probs > 0.5).astype(int) if is_binary else all_probs.argmax(axis=-1)
 
     metrics = compute_per_disease_metrics(
@@ -663,6 +690,25 @@ def train(config, output_dir):
         mask_output_size=tuple(config['model'].get('mask_output_size', [56, 56])),
     )
     model = model.to(device)
+
+    # init_from: optionally load weights from a previous experiment checkpoint
+    # (e.g. G3 → G4). Uses strict=False so new heads (roi_head, mask_head) can be missing.
+    init_from = config['model'].get('init_from')
+    if init_from:
+        if not os.path.isabs(init_from):
+            init_from = os.path.join(project_root, init_from)
+        if os.path.exists(init_from):
+            ckpt_init = torch.load(init_from, map_location='cpu', weights_only=False)
+            state_init = ckpt_init.get('model_state_dict', ckpt_init)
+            missing, unexpected = model.load_state_dict(state_init, strict=False)
+            if is_main_process():
+                print("init_from %s: missing=%d unexpected=%d" % (
+                    init_from, len(missing), len(unexpected)))
+                if missing:
+                    print("  missing (new layers):", missing[:10])
+        else:
+            if is_main_process():
+                print("WARNING: init_from path not found: %s" % init_from)
 
     # Multi-GPU support
     if is_ddp:

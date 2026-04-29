@@ -42,7 +42,7 @@ model:
   mask_output_size: [56, 56]  # 2D mask resolution
 
   # Optional: init from g4 best_model
-  # init_from: outputs_clean/experiments/g4_grounded_swin_roi_clean/best_model.pt
+  init_from: outputs_clean/experiments/g4_grounded_swin_roi_clean/best_model.pt
 
 training:
   num_classes: 2

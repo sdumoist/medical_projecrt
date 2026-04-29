@@ -50,6 +50,10 @@ def build_val_loader(config, raw_labels_lookup, project_root):
         all_exam_ids, raw_labels_lookup, task_mode=task_mode, val_ratio=0.2)
 
     load_dense_masks = config['data'].get('load_dense_masks', False)
+    load_roi_targets = config['data'].get('load_roi_targets', False)
+    grounding_target_path = config['data'].get('grounding_target_path', None)
+    if grounding_target_path and not os.path.isabs(grounding_target_path):
+        grounding_target_path = os.path.join(project_root, grounding_target_path)
     val_dataset = ShoulderCacheDataset(
         cache_root=cache_root,
         exam_ids=set(val_ids),
@@ -58,6 +62,9 @@ def build_val_loader(config, raw_labels_lookup, project_root):
         cache_mode=cache_mode,
         project_root=project_root,
         load_dense_masks=load_dense_masks,
+        load_roi_targets=load_roi_targets,
+        grounding_target_path=grounding_target_path,
+        mask_output_size=tuple(config['model'].get('mask_output_size', [56, 56])),
     )
     print("Val dataset: %d samples" % len(val_dataset))
 
@@ -75,12 +82,15 @@ def build_val_loader(config, raw_labels_lookup, project_root):
     return val_loader, num_classes
 
 
-def evaluate(model, loader, device, use_localizer, num_classes, amp_dtype):
+def evaluate(model, loader, device, use_localizer, num_classes, amp_dtype,
+             use_roi_head=False):
     model.eval()
     is_binary = (num_classes == 2)
 
     all_preds, all_probs, all_labels, all_masks = [], [], [], []
     all_pred_slices, all_gt_slices, all_slice_valid = [], [], []
+    # ROI box evaluation
+    all_pred_boxes, all_gt_boxes, all_box_valid = [], [], []
 
     use_amp = amp_dtype != torch.float32
 
@@ -125,6 +135,14 @@ def evaluate(model, loader, device, use_localizer, num_classes, amp_dtype):
                     all_gt_slices.append(gt_scaled)
                     all_slice_valid.append((gt_ks >= 0).astype(np.float32))
 
+            # ROI box evaluation
+            if use_roi_head and 'roi_box_2d' in output:
+                pred_box = output['roi_box_2d'].cpu().numpy()   # [B, 7, 4]
+                all_pred_boxes.append(pred_box)
+                if "roi_box_2d_gt" in batch:
+                    all_gt_boxes.append(batch["roi_box_2d_gt"].numpy())
+                    all_box_valid.append(batch["roi_box_valid"].numpy())
+
     all_preds  = np.concatenate(all_preds,  axis=0)
     all_probs  = np.concatenate(all_probs,  axis=0)
     all_labels = np.concatenate(all_labels, axis=0)
@@ -142,6 +160,15 @@ def evaluate(model, loader, device, use_localizer, num_classes, amp_dtype):
             np.concatenate(all_slice_valid,  axis=0),
             DISEASES)
         metrics['key_slice'] = ks
+
+    # ROI box metrics
+    if use_roi_head and all_pred_boxes and all_gt_boxes:
+        from utils.metrics import compute_box_metrics
+        pred_boxes_all = np.concatenate(all_pred_boxes, axis=0)  # [N, 7, 4]
+        gt_boxes_all   = np.concatenate(all_gt_boxes,   axis=0)  # [N, 7, 4]
+        valid_mask_all = np.concatenate(all_box_valid,  axis=0)  # [N, 7]
+        metrics['box'] = compute_box_metrics(
+            pred_boxes_all, gt_boxes_all, valid_mask_all, DISEASES)
 
     return metrics
 
@@ -180,6 +207,8 @@ def main():
     val_loader, num_classes = build_val_loader(config, raw_labels_lookup, project_root)
     is_binary = (num_classes == 2)
     use_localizer = config['model'].get('use_localizer', False)
+    use_roi_head  = config['model'].get('use_roi_head',  False)
+    use_mask_head = config['model'].get('use_mask_head', False)
 
     # Build model
     model = create_model(
@@ -191,14 +220,19 @@ def main():
         branch_alpha=config['training'].get('branch_alpha', 0.3),
         use_localizer=use_localizer,
         num_classes=num_classes,
+        use_roi_head=use_roi_head,
+        use_mask_head=use_mask_head,
+        mask_output_size=tuple(config['model'].get('mask_output_size', [56, 56])),
     )
     model = model.to(device)
 
-    # Load checkpoint
+    # Load checkpoint (strict=False allows evaluating a G3 ckpt with G4 model shape)
     print("Loading checkpoint: %s" % args.checkpoint)
-    ckpt = torch.load(args.checkpoint, map_location=device)
+    ckpt = torch.load(args.checkpoint, map_location=device, weights_only=False)
     state = ckpt.get('model_state_dict', ckpt)
-    model.load_state_dict(state, strict=True)
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing:
+        print("  missing keys (new heads): %d" % len(missing))
     ckpt_epoch = ckpt.get('epoch', '?')
     print("Checkpoint epoch: %s" % ckpt_epoch)
 
@@ -208,7 +242,8 @@ def main():
 
     # Evaluate
     print("Running evaluation on %d val batches..." % len(val_loader))
-    metrics = evaluate(model, val_loader, device, use_localizer, num_classes, amp_dtype)
+    metrics = evaluate(model, val_loader, device, use_localizer, num_classes,
+                       amp_dtype, use_roi_head=use_roi_head)
 
     # Summarize
     from train import summarize_macro_metrics
@@ -227,6 +262,11 @@ def main():
         ks = metrics['key_slice']
         result["key_slice_top1"] = round(ks.get('macro_ks_top1', 0), 4)
         result["key_slice_pm1"]  = round(ks.get('macro_ks_pm1',  0), 4)
+    if 'box' in metrics:
+        bm = metrics['box']
+        result["macro_box_iou"]    = round(bm.get('macro_box_iou',       0), 4)
+        result["macro_box_iou_03"] = round(bm.get('macro_box_iou_at_03', 0), 4)
+        result["macro_box_iou_05"] = round(bm.get('macro_box_iou_at_05', 0), 4)
 
     # Print summary
     print("\n=== Eval Results ===")
@@ -236,6 +276,10 @@ def main():
     if 'key_slice_top1' in result:
         print("  KS top1      : %.4f" % result['key_slice_top1'])
         print("  KS ±1        : %.4f" % result['key_slice_pm1'])
+    if 'macro_box_iou' in result:
+        print("  Box IoU      : %.4f" % result['macro_box_iou'])
+        print("  Box IoU@0.3  : %.4f" % result['macro_box_iou_03'])
+        print("  Box IoU@0.5  : %.4f" % result['macro_box_iou_05'])
     print("\n  Per-disease:")
     print("    %-6s  %6s  %6s  %6s" % ("", "AUC", "F1", "OptF1"))
     for d in DISEASES:

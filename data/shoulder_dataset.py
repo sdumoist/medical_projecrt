@@ -49,6 +49,7 @@ class ShoulderCacheDataset(Dataset):
         load_dense_masks=False,
         load_roi_targets=False,
         grounding_target_path=None,
+        mask_output_size=(56, 56),
     ):
         """
         Args:
@@ -69,11 +70,14 @@ class ShoulderCacheDataset(Dataset):
                               and roi_box_valid [7]. Requires grounding_target_path.
             grounding_target_path: path to grounding_targets.json (from
                               scripts/build_grounding_targets.py).
+            mask_output_size: (H, W) to resize per-disease 2D key-slice masks
+                              for mask_2d_gt. Only used when load_dense_masks=True.
         """
         self.cache_mode = cache_mode
         self.min_z = min_z
         self.load_dense_masks = load_dense_masks
         self.load_roi_targets = load_roi_targets
+        self.mask_output_size = tuple(mask_output_size)
         self.label_mapper = label_mapper
         self.raw_labels_lookup = raw_labels_lookup or {}
         self.project_root = project_root or os.getcwd()
@@ -203,6 +207,33 @@ class ShoulderCacheDataset(Dataset):
                     if m is not None and isinstance(m, torch.Tensor):
                         sm[i, z_offset:z_offset + Z_orig] = m
                 out["localizer_mask"] = sm
+
+                # --- 2D mask GT for MaskHead2D (G5) ---
+                # For each disease, extract the key-slice 2D mask and resize to
+                # mask_output_size. mask_2d_valid[i]=1 iff key_slice >= 0 AND
+                # the slice has at least one nonzero pixel.
+                MH, MW = self.mask_output_size
+                mask_2d_gt    = torch.zeros(7, MH, MW, dtype=torch.float32)
+                mask_2d_valid = torch.zeros(7, dtype=torch.float32)
+                for i, d in enumerate(DISEASES):
+                    ks_val = int(ks[i].item())
+                    if ks_val < 0:
+                        continue  # no key slice annotation
+                    # ks_val is already z_offset-adjusted (into Z_out space)
+                    if ks_val >= sm.shape[1]:
+                        continue
+                    slice_2d = sm[i, ks_val].float()  # [H, W]
+                    if slice_2d.sum() == 0:
+                        continue
+                    # Resize to mask_output_size using bilinear interpolation
+                    slice_4d = slice_2d.unsqueeze(0).unsqueeze(0)  # [1,1,H,W]
+                    resized = torch.nn.functional.interpolate(
+                        slice_4d, size=(MH, MW), mode='bilinear', align_corners=False
+                    ).squeeze(0).squeeze(0)  # [MH, MW]
+                    mask_2d_gt[i]    = (resized > 0.5).float()
+                    mask_2d_valid[i] = 1.0
+                out["mask_2d_gt"]    = mask_2d_gt     # [7, MH, MW]
+                out["mask_2d_valid"] = mask_2d_valid  # [7]
 
         # --- ROI 2D box targets (from precomputed grounding_targets.json) ---
         if self.load_roi_targets and self.roi_targets:

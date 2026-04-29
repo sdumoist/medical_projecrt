@@ -172,14 +172,15 @@ def compute_roi_from_mask(mask_3d, key_slice_z):
         return result
 
     y1, x1, y2, x2 = bbox
-    # Normalize to [0, 1]
+    # Normalize to [0, 1] using (coord + 1) / dim so that single-pixel masks
+    # produce a non-zero box width/height.
     box_2d = [
         round(x1 / W, 4),
         round(y1 / H, 4),
-        round(x2 / W, 4),
-        round(y2 / H, 4),
+        round((x2 + 1) / W, 4),
+        round((y2 + 1) / H, 4),
     ]
-    area = ((x2 - x1) * (y2 - y1)) / (H * W)
+    area = ((x2 + 1 - x1) * (y2 + 1 - y1)) / (H * W)
 
     result["has_target"] = True
     result["box_2d"] = box_2d

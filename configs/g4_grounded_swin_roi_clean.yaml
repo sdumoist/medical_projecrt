@@ -62,7 +62,7 @@ training:
   roi_alpha: 0.2
 
   # Optional: init from g3 best_model
-  # init_from: outputs_clean/experiments/g3_grounded_swin_binary_clean/best_model.pt
+  init_from: outputs_clean/experiments/g3_grounded_swin_binary_clean/best_model.pt
 
 validation:
   val_interval: 1

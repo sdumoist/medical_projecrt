@@ -39,7 +39,7 @@ from sft.modeling import (
     freeze_module, unfreeze_module, apply_freeze_strategy,
 )
 from sft.dataset import SFTDataset
-from rl.grpo_dataset import GRPODataset, grpo_collate_fn
+from rl.grpo_dataset import GRPODataset, make_grpo_collate
 from rl.grpo_utils import (
     rollout_batch, compute_advantages, compute_token_log_probs, grpo_loss,
 )
@@ -64,7 +64,7 @@ def build_model(config, device):
         llm.model_path, llm.lora_rank, ...
     """
     from transformers import AutoTokenizer, AutoModelForCausalLM
-    from peft import LoraConfig, get_peft_model, PeftModel
+    from peft import LoraConfig, get_peft_model
 
     mri_cv_cfg = config["mri_cv"]
     proj_cfg = config["projector"]
@@ -109,11 +109,20 @@ def build_model(config, device):
 
     # Load from SFT checkpoint if provided
     sft_checkpoint = config.get("rl", {}).get("sft_checkpoint")
+    if sft_checkpoint:
+        if not os.path.isabs(sft_checkpoint):
+            sft_checkpoint = os.path.join(PROJECT_ROOT, sft_checkpoint)
     if sft_checkpoint and os.path.exists(sft_checkpoint):
-        llm = PeftModel.from_pretrained(llm_base, sft_checkpoint)
-        print("Loaded SFT checkpoint for LoRA: %s" % sft_checkpoint)
+        # SFT checkpoint format: single .pt with projector_state_dict + lora_state_dict
+        sft_ckpt = torch.load(sft_checkpoint, map_location="cpu", weights_only=False)
+        llm = get_peft_model(llm_base, lora_config)
+        if "lora_state_dict" in sft_ckpt:
+            llm.load_state_dict(sft_ckpt["lora_state_dict"], strict=False)
+        print("Loaded SFT LoRA from: %s" % sft_checkpoint)
     else:
         llm = get_peft_model(llm_base, lora_config)
+        if sft_checkpoint:
+            print("WARNING: SFT checkpoint not found: %s" % sft_checkpoint)
         print("Initialized fresh LoRA (no SFT checkpoint)")
 
     # ── Projector ──
@@ -134,12 +143,12 @@ def build_model(config, device):
     )
 
     # Load projector weights from SFT checkpoint if provided
-    if sft_checkpoint:
-        proj_ckpt = os.path.join(os.path.dirname(sft_checkpoint), "projector.pt")
-        if os.path.exists(proj_ckpt):
-            model.projector.load_state_dict(
-                torch.load(proj_ckpt, map_location="cpu", weights_only=False))
-            print("Loaded projector from: %s" % proj_ckpt)
+    if sft_checkpoint and os.path.exists(sft_checkpoint):
+        sft_ckpt_data = torch.load(sft_checkpoint, map_location="cpu",
+                                   weights_only=False)
+        if "projector_state_dict" in sft_ckpt_data:
+            model.projector.load_state_dict(sft_ckpt_data["projector_state_dict"])
+            print("Loaded projector from SFT checkpoint")
 
     model = model.to(device)
     return model, tokenizer
@@ -194,15 +203,24 @@ def train_grpo(config, args):
     if isinstance(train_jsonl_files, str):
         train_jsonl_files = [train_jsonl_files]
 
+    def resolve(p):
+        if p and not os.path.isabs(p):
+            return os.path.join(PROJECT_ROOT, p)
+        return p
+
+    num_vis_tokens = config["projector"].get("num_visual_tokens", 10)
     train_dataset = GRPODataset(
-        jsonl_files=train_jsonl_files,
-        cache_root=data_cfg.get("cache_root", ""),
-        cache_mode=data_cfg.get("cache_mode", "loc"),
+        jsonl_paths=[resolve(p) for p in train_jsonl_files],
+        cache_root=resolve(data_cfg.get("cache_root", "")),
+        cache_index_path=resolve(data_cfg.get("cache_index", "")),
         tokenizer=tokenizer,
-        max_seq_length=data_cfg.get("max_seq_length", 2048),
-        num_visual_tokens=config["projector"].get("num_visual_tokens", 10),
-        max_samples=getattr(args, "max_samples", None),
+        max_length=data_cfg.get("max_seq_length", 2048),
+        num_visual_tokens=num_vis_tokens,
     )
+
+    if args.max_samples and args.max_samples > 0:
+        train_dataset.samples = train_dataset.samples[:args.max_samples]
+        print("Smoke test: limited to %d samples" % args.max_samples)
 
     if is_ddp:
         from torch.utils.data.distributed import DistributedSampler
@@ -218,7 +236,10 @@ def train_grpo(config, args):
         batch_size=config["training"].get("batch_size", 1),
         shuffle=shuffle,
         sampler=sampler,
-        collate_fn=grpo_collate_fn,
+        collate_fn=make_grpo_collate(
+            pad_token_id=tokenizer.pad_token_id,
+            num_visual_tokens=num_vis_tokens,
+        ),
         num_workers=data_cfg.get("num_workers", 2),
     )
 
@@ -260,17 +281,17 @@ def train_grpo(config, args):
         epoch_losses = []
 
         for step, batch in enumerate(train_loader):
-            images = batch["images"].to(device)
+            images = batch["image"].to(device)
             input_ids = batch["input_ids"].to(device)
             attention_mask = batch["attention_mask"].to(device)
-            output_strs = batch["output_str"]
-            task_types = batch["task_type"]
+            output_strs = batch["output_texts"]
+            task_types = batch["task_types"]
 
             B = images.shape[0]
 
             # 1. Rollout: generate G completions per prompt
             rollout_batch_data = {
-                "images": images,
+                "image": images,
                 "input_ids": input_ids,
                 "attention_mask": attention_mask,
             }

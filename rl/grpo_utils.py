@@ -28,7 +28,7 @@ def rollout_batch(model, tokenizer, batch, num_generations=4,
     Args:
         model:           ShoulderSFTModel
         tokenizer:       HuggingFace tokenizer
-        batch:           dict from grpo_collate_fn (images, input_ids, attention_mask, ...)
+        batch:           dict from grpo_collate_fn (image, input_ids, attention_mask, ...)
         num_generations: G (group size per prompt)
         max_new_tokens:  max tokens to generate
         temperature:     sampling temperature (>0 for diversity)
@@ -40,7 +40,7 @@ def rollout_batch(model, tokenizer, batch, num_generations=4,
         gen_attention_mask: BoolTensor [B*G, L+T]
         prompt_len:    int — length of prompt tokens (for masking prompt loss)
     """
-    images = batch["images"].to(device)
+    images = batch["image"].to(device)
     input_ids = batch["input_ids"].to(device)
     attention_mask = batch["attention_mask"].to(device)
     B, L = input_ids.shape
@@ -51,9 +51,9 @@ def rollout_batch(model, tokenizer, batch, num_generations=4,
     attn_rep = attention_mask.repeat_interleave(num_generations, dim=0)  # [B*G, L]
 
     gen_ids = model.generate(
-        images=images_rep,
-        input_ids=input_ids_rep,
-        attention_mask=attn_rep,
+        images_rep,
+        input_ids_rep,
+        attn_rep,
         max_new_tokens=max_new_tokens,
         do_sample=True,
         temperature=temperature,
@@ -123,9 +123,9 @@ def compute_token_log_probs(model, images, gen_ids, gen_attn, prompt_len):
     labels[:, :prompt_len] = -100  # mask prompt
 
     outputs, _ = model(
-        images=images,
-        input_ids=gen_ids,
-        attention_mask=gen_attn,
+        images,
+        gen_ids,
+        gen_attn,
         labels=labels,
     )
     # outputs.logits: [B*G, L+T, V]
