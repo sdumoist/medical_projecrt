@@ -404,11 +404,13 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                       flush=True)
 
             if mode == "train":
-                if use_amp:
+                if scaler is not None:
+                    # fp16: use GradScaler to prevent underflow
                     scaler.scale(loss).backward()
                     scaler.step(optimizer)
                     scaler.update()
                 else:
+                    # bf16 / no-amp: plain backward (autocast still active above)
                     loss.backward()
                     optimizer.step()
 
@@ -605,8 +607,10 @@ def train(config, output_dir):
             if is_ddp and not is_main_process():
                 dist.barrier()  # wait for rank 0 to finish val
             else:
+                # Use raw model (not DDP-wrapped) to avoid triggering all_reduce during val
+                raw_model = model.module if is_ddp else model
                 val_metrics = train_epoch(
-                    model, val_loader, optimizer, criterion, device, branch_alpha,
+                    raw_model, val_loader, optimizer, criterion, device, branch_alpha,
                     "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
                     num_classes=num_classes, scaler=None, amp_dtype=amp_dtype)
                 if is_ddp:
