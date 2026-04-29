@@ -661,6 +661,8 @@ def train(config, output_dir):
     jsonl_path = os.path.join(output_dir, "metrics_epoch.jsonl")
 
     for epoch in range(epochs):
+        should_stop = False   # reset each epoch; set inside val block or by broadcast
+
         # DDP: set epoch for sampler shuffling
         if is_ddp and hasattr(train_loader.sampler, 'set_epoch'):
             train_loader.sampler.set_epoch(epoch)

@@ -11,6 +11,7 @@ data:
   use_cache: true
   cache_mode: loc
   cache_root: outputs_clean/cache_loc
+  load_dense_masks: false
 
   sequences:
     - axial_PD
