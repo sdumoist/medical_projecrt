@@ -138,6 +138,80 @@ def sentence_fuzzy_hit(pred_sentences, ref_sentences, threshold=0.5):
 DISEASES = ["SST", "IST", "SSC", "LHBT", "IGHL", "RIPI", "GHOA"]
 
 
+# ── Grounding extraction (used by GC-GRPO) ────────────────────────────────
+
+def extract_predicted_keyslices(generation):
+    """Extract predicted key-slice indices from generated JSON.
+
+    Expects visual_grounding.{disease}.key_slice in the parsed JSON.
+
+    Returns:
+        dict {disease: int or None}  — None if absent or unparseable
+    """
+    parsed = safe_parse_json(generation)
+    if parsed is None:
+        return {}
+    vg = parsed.get("visual_grounding", {})
+    result = {}
+    for d in DISEASES:
+        entry = vg.get(d)
+        ks = entry.get("key_slice") if isinstance(entry, dict) else None
+        if ks is not None:
+            try:
+                result[d] = int(ks)
+            except (TypeError, ValueError):
+                result[d] = None
+        else:
+            result[d] = None
+    return result
+
+
+def extract_gt_keyslices(reference_output_str):
+    """Extract GT key-slice indices from reference JSON string."""
+    try:
+        ref = json.loads(reference_output_str)
+    except Exception:
+        return {}
+    vg = ref.get("visual_grounding", {})
+    result = {}
+    for d in DISEASES:
+        entry = vg.get(d)
+        ks = entry.get("key_slice") if isinstance(entry, dict) else None
+        if ks is not None:
+            try:
+                result[d] = int(ks)
+            except (TypeError, ValueError):
+                result[d] = None
+        else:
+            result[d] = None
+    return result
+
+
+def is_grounding_correct(pred_ks, gt_ks, tolerance=1, min_disease_frac=0.5):
+    """Decide whether a rollout belongs to G+ (correctly grounded).
+
+    A rollout is correctly grounded if at least `min_disease_frac` of diseases
+    that have GT key-slices have predicted key-slices within ±tolerance.
+
+    Args:
+        pred_ks:          dict {disease: int or None} from extract_predicted_keyslices
+        gt_ks:            dict {disease: int or None} from extract_gt_keyslices
+        tolerance:        acceptable slice index distance (default ±1)
+        min_disease_frac: fraction of valid diseases that must be correct (default 0.5)
+
+    Returns:
+        bool
+    """
+    valid = [d for d in DISEASES if gt_ks.get(d) is not None]
+    if not valid:
+        return False  # no GT grounding → cannot judge
+    correct = sum(
+        1 for d in valid
+        if pred_ks.get(d) is not None and abs(pred_ks[d] - gt_ks[d]) <= tolerance
+    )
+    return (correct / len(valid)) >= min_disease_frac
+
+
 # ── Reward functions ───────────────────────────────────────────────────────
 
 def reward_label_binary(generation, reference):

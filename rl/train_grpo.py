@@ -41,9 +41,13 @@ from sft.modeling import (
 from sft.dataset import SFTDataset
 from rl.grpo_dataset import GRPODataset, make_grpo_collate
 from rl.grpo_utils import (
-    rollout_batch, compute_advantages, compute_token_log_probs, grpo_loss,
+    rollout_batch, compute_advantages, compute_gc_advantages,
+    compute_token_log_probs, grpo_loss,
 )
-from rl.reward_functions import compute_reward
+from rl.reward_functions import (
+    compute_reward,
+    extract_predicted_keyslices, extract_gt_keyslices, is_grounding_correct,
+)
 
 
 # ── Config ────────────────────────────────────────────────────────────────
@@ -192,6 +196,7 @@ def train_grpo(config, args):
     if is_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank])
+        model._set_static_graph()
 
     raw_model = model.module if is_ddp else model
 
@@ -253,11 +258,21 @@ def train_grpo(config, args):
 
     # ── GRPO hyperparams ──
     num_generations = rl_cfg.get("num_generations", 4)
-    max_new_tokens = rl_cfg.get("max_new_tokens", 512)
-    temperature = rl_cfg.get("temperature", 0.9)
-    beta = rl_cfg.get("kl_beta", 0.01)
-    max_epochs = train_cfg.get("max_epochs", 2)
-    max_grad_norm = train_cfg.get("max_grad_norm", 1.0)
+    max_new_tokens  = rl_cfg.get("max_new_tokens", 512)
+    temperature     = rl_cfg.get("temperature", 0.9)
+    beta            = rl_cfg.get("kl_beta", 0.01)
+    max_epochs      = train_cfg.get("max_epochs", 2)
+    max_grad_norm   = train_cfg.get("max_grad_norm", 1.0)
+    algorithm       = rl_cfg.get("algorithm", "grpo")   # "grpo" or "gc_grpo"
+    gc_alpha        = rl_cfg.get("gc_alpha", 0.5)       # GC-GRPO inter-group bonus
+    gc_tolerance    = rl_cfg.get("gc_tolerance", 1)     # key-slice ±tolerance
+    gc_min_frac     = rl_cfg.get("gc_min_disease_frac", 0.5)
+
+    if is_main:
+        print("Algorithm: %s%s" % (
+            algorithm,
+            "  (alpha=%.2f, tol=%d, min_frac=%.2f)" % (gc_alpha, gc_tolerance, gc_min_frac)
+            if algorithm == "gc_grpo" else ""))
 
     # ── Output ──
     output_cfg = config.get("output", {})
@@ -316,7 +331,31 @@ def train_grpo(config, args):
             epoch_rewards.extend(rewards_list)
 
             # 3. Advantages [B*G]
-            advantages = compute_advantages(rewards, num_generations)
+            gc_stats = {}
+            if algorithm == "gc_grpo":
+                # Build grounded_mask: True if rollout correctly located key-slices
+                grounded_list = []
+                for i in range(B):
+                    ref_str = output_strs[i]
+                    tt = task_types[i]
+                    # Only diagnosis_chain has visual_grounding; others → all G-
+                    if tt == "diagnosis_chain":
+                        gt_ks = extract_gt_keyslices(ref_str)
+                    else:
+                        gt_ks = {}
+                    for j in range(num_generations):
+                        pred_ks = extract_predicted_keyslices(generations[i][j])
+                        grounded_list.append(
+                            is_grounding_correct(pred_ks, gt_ks,
+                                                 tolerance=gc_tolerance,
+                                                 min_disease_frac=gc_min_frac)
+                        )
+                grounded_mask = torch.tensor(grounded_list, dtype=torch.bool, device=device)
+                advantages, gc_stats = compute_gc_advantages(
+                    rewards, grounded_mask, num_generations,
+                    alpha=gc_alpha)
+            else:
+                advantages = compute_advantages(rewards, num_generations)
 
             # 4. Log-probs from current and reference policy
             images_rep = images.repeat_interleave(num_generations, dim=0)
@@ -340,10 +379,17 @@ def train_grpo(config, args):
             optimizer.step()
 
             if is_main and step % 10 == 0:
-                print("Epoch %d step %d | loss=%.4f policy=%.4f kl=%.4f reward=%.4f" % (
+                gc_info = ""
+                if gc_stats:
+                    gc_info = " gc_frac=%.2f gnd=%.2f" % (
+                        gc_stats.get("gc_applied_frac", 0),
+                        gc_stats.get("mean_grounded_frac", 0))
+                print("Epoch %d step %d | loss=%.4f policy=%.4f kl=%.4f reward=%.4f%s" % (
                     epoch + 1, step,
                     loss_dict["total_loss"], loss_dict["policy_loss"],
-                    loss_dict["kl_loss"], sum(rewards_list[-num_generations:]) / num_generations))
+                    loss_dict["kl_loss"],
+                    sum(rewards_list[-num_generations:]) / num_generations,
+                    gc_info))
 
         # ── End of epoch ──
         mean_reward = sum(epoch_rewards) / len(epoch_rewards) if epoch_rewards else 0.0

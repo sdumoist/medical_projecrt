@@ -103,7 +103,81 @@ def compute_advantages(rewards, num_generations, eps=1e-8):
     return advantages.view(B_G)  # [B*G]
 
 
-# ── Log-probability computation ────────────────────────────────────────────
+def compute_gc_advantages(rewards, grounded_mask, num_generations,
+                          alpha=0.5, eps=1e-8):
+    """Grounding-Conditioned GRPO advantage computation (GC-GRPO).
+
+    For each sample i, split G rollouts into:
+        G+_i = {j : grounded_mask[i*G+j] == True}   (correctly located)
+        G-_i = {j : grounded_mask[i*G+j] == False}  (wrong or absent grounding)
+
+    Advantage for each rollout:
+        advantage_intra  = within-group normalized advantage (standard GRPO)
+        advantage_inter  = alpha * (mean(R_G+) - mean(R_G-))  [only for G+ members]
+        advantage_final  = advantage_intra + advantage_inter
+
+    Degenerate case (all G+ or all G-): falls back to standard GRPO for that sample.
+
+    Args:
+        rewards:         Tensor [B*G] flat rewards
+        grounded_mask:   BoolTensor [B*G]  True = rollout is in G+
+        num_generations: G
+        alpha:           inter-group bonus weight (default 0.5)
+        eps:             numerical stability epsilon
+
+    Returns:
+        advantages: Tensor [B*G]
+        stats:      dict — grounding statistics for logging
+    """
+    B_G = rewards.shape[0]
+    B = B_G // num_generations
+    G = num_generations
+
+    rewards_2d   = rewards.view(B, G)        # [B, G]
+    grounded_2d  = grounded_mask.view(B, G)  # [B, G]
+    adv_2d       = torch.zeros(B, G, device=rewards.device, dtype=rewards.dtype)
+
+    n_gc_applied = 0  # samples where GC inter-group bonus was actually applied
+
+    for i in range(B):
+        r    = rewards_2d[i]   # [G]
+        gm   = grounded_2d[i]  # [G] bool
+
+        pos_idx = gm.nonzero(as_tuple=True)[0]   # indices of G+
+        neg_idx = (~gm).nonzero(as_tuple=True)[0] # indices of G-
+        n_pos, n_neg = len(pos_idx), len(neg_idx)
+
+        # ── Degenerate: all in one group → standard GRPO ──
+        if n_pos == 0 or n_neg == 0:
+            mu  = r.mean()
+            std = r.std() if G > 1 else torch.tensor(0.0, device=rewards.device)
+            adv_2d[i] = (r - mu) / (std + eps)
+            continue
+
+        # ── Within-group normalization ──
+        r_pos = r[pos_idx]
+        mu_pos  = r_pos.mean()
+        std_pos = r_pos.std() if n_pos > 1 else torch.tensor(0.0, device=rewards.device)
+        adv_2d[i][pos_idx] = (r_pos - mu_pos) / (std_pos + eps)
+
+        r_neg = r[neg_idx]
+        mu_neg  = r_neg.mean()
+        std_neg = r_neg.std() if n_neg > 1 else torch.tensor(0.0, device=rewards.device)
+        adv_2d[i][neg_idx] = (r_neg - mu_neg) / (std_neg + eps)
+
+        # ── Inter-group bonus for G+ ──
+        inter_bonus = mu_pos - mu_neg   # positive when correct grounding yields higher reward
+        adv_2d[i][pos_idx] = adv_2d[i][pos_idx] + alpha * inter_bonus
+        n_gc_applied += 1
+
+    stats = {
+        "gc_applied_frac":    n_gc_applied / max(B, 1),
+        "mean_grounded_frac": grounded_2d.float().mean().item(),
+    }
+    return adv_2d.view(B_G), stats
+
+
+
 
 def compute_token_log_probs(model, images, gen_ids, gen_attn, prompt_len):
     """Forward pass to get log-probs of generated tokens.

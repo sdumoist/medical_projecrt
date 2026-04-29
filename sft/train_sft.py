@@ -216,6 +216,9 @@ def validate(model, loader, tokenizer, device, max_new_tokens=512):
 
     avg_loss = total_loss / max(num_steps, 1)
 
+    # Free KV-cache and intermediate tensors accumulated during generation
+    torch.cuda.empty_cache()
+
     # Aggregate per-task metrics
     task_summaries = {}
     for task, results in results_by_task.items():
@@ -319,7 +322,7 @@ def train(config, args):
     llm_dim = llm.config.hidden_size
 
     if llm_cfg.get("gradient_checkpointing", False):
-        llm.gradient_checkpointing_enable()
+        llm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
 
     # Apply LoRA
     lora_config = LoraConfig(
@@ -354,8 +357,8 @@ def train(config, args):
     model_for_train = model
     if use_ddp:
         model_for_train = DDP(
-            model, device_ids=[local_rank], output_device=local_rank,
-            find_unused_parameters=True)
+            model, device_ids=[local_rank], output_device=local_rank)
+        model_for_train._set_static_graph()
 
     # ── Resume from checkpoint ──
     start_epoch = 0
@@ -514,19 +517,22 @@ def train(config, args):
             print("  Train loss: %.4f (steps: %d)" % (
                 train_metrics["loss"], train_metrics["steps"]))
 
-        # Validation (run on all ranks, only main rank logs/saves)
+        # Validation (only rank 0 runs validate to avoid DDP sync issues
+        # with model.generate() in non-DDP mode)
         val_metrics = None
         val_interval = config.get("validation", {}).get("val_interval", 1)
         if val_loader and (epoch + 1) % val_interval == 0:
-            gen_max = config.get("validation", {}).get(
-                "generation_max_length", 512)
-            # Unwrap DDP for generation
-            eval_model = model_for_train.module if use_ddp else model_for_train
-            val_metrics = validate(
-                eval_model, val_loader, tokenizer, device,
-                max_new_tokens=gen_max)
-
+            if use_ddp:
+                dist.barrier()  # sync all ranks before rank-0-only validate
             if is_main:
+                gen_max = config.get("validation", {}).get(
+                    "generation_max_length", 512)
+                # Unwrap DDP for generation
+                eval_model = model_for_train.module if use_ddp else model_for_train
+                val_metrics = validate(
+                    eval_model, val_loader, tokenizer, device,
+                    max_new_tokens=gen_max)
+
                 print("  Val loss: %.4f  (eval samples: %d)" % (
                     val_metrics["loss"], val_metrics["num_eval_samples"]))
 
@@ -536,7 +542,10 @@ def train(config, args):
                         parts.append("%s=%.3f" % (k, v))
                     print(" ".join(parts))
 
-            is_best = val_metrics["loss"] < best_val_loss
+            if use_ddp:
+                dist.barrier()  # wait for rank 0 to finish before next epoch
+
+            is_best = (val_metrics is not None) and (val_metrics["loss"] < best_val_loss)
         else:
             is_best = False
 
@@ -622,4 +631,13 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import traceback as _tb
+    _rank = int(os.environ.get("LOCAL_RANK", 0))
+    _log = "/tmp/sft_rank%d_error.log" % _rank
+    try:
+        main()
+    except Exception:
+        with open(_log, "w") as _f:
+            _tb.print_exc(file=_f)
+        _tb.print_exc()
+        raise

@@ -1,0 +1,72 @@
+# GC-GRPO Stage 1: Grounding-Conditioned GRPO (core paper contribution C3).
+# Splits G rollouts by key-slice correctness:
+#   G+ = correctly grounded rollouts → within-group advantage + inter-group bonus
+#   G- = misgrounded rollouts       → within-group advantage only
+# Degenerates to standard GRPO when all rollouts are G+ or all G-.
+
+# ── MRI-CV backbone ──
+mri_cv:
+  encoder: "swin3d_tiny"
+  checkpoint_path: "outputs_clean/experiments/g3_grounded_swin_binary_clean/best_model.pt"
+  use_localizer: true
+  use_roi_tokens: false   # 10-token layout (3 global + 7 local)
+  freeze: true
+
+# ── Visual Projector ──
+projector:
+  num_visual_tokens: 10
+
+# ── LLM ──
+llm:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  model_path: "/mnt/cfs_algo_bj/models/opensource_model/Qwen/Qwen2.5-7B-Instruct"
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  lora_dropout: 0.05
+  torch_dtype: "bfloat16"
+
+# ── RL-specific ──
+rl:
+  # SFT checkpoint to initialize from
+  sft_checkpoint: "outputs_clean/sft_experiments/sft_stage1_grounded_clean/best_checkpoint"
+
+  # Algorithm: "grpo" (standard) or "gc_grpo" (GC-GRPO)
+  algorithm: "gc_grpo"
+
+  # GRPO hyperparams
+  num_generations: 4      # G: group size (must be ≥ 2 for within-group normalization)
+  max_new_tokens: 512
+  temperature: 0.9
+  kl_beta: 0.01
+
+  # GC-GRPO specific
+  gc_alpha: 0.5           # Inter-group bonus weight: advantage_G+ += alpha * (mean_G+ - mean_G-)
+  gc_tolerance: 1         # Key-slice ±tolerance to count as correctly grounded
+  gc_min_disease_frac: 0.5  # Min fraction of diseases that must be correctly grounded
+
+# ── Data ──
+data:
+  cache_root: "outputs_clean/cache_loc"
+  cache_mode: "loc"
+  cache_index: "outputs_clean/cache_loc/cache_loc_index.csv"
+  max_seq_length: 2048
+
+  train_jsonl:
+    - "outputs_clean/sft_data/split/sft_label_binary_train.jsonl"
+    - "outputs_clean/sft_data/split/sft_diagnosis_chain_train.jsonl"
+
+# ── Training ──
+training:
+  batch_size: 1
+  num_workers: 2
+  max_epochs: 2
+  learning_rate: 0.000005  # 5e-6
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  seed: 42
+
+# ── Output ──
+output:
+  exp_name: "rl_gcgrpo_stage1_clean"
+  output_dir: "outputs_clean/rl_experiments"
