@@ -14,11 +14,20 @@ DISEASE_LIST_ZH = (
 )
 
 # Visual slot description appended to system prompts for grounded tasks
+# V1: 10 tokens (3 global + 7 local key-slice)
 VISUAL_SLOT_DESC = (
     "你将接收到10个视觉特征槽位，前3个是全局特征"
     "（矢状位、冠状位、轴位），后7个是病种专属局部特征"
     "（SST、IST、SSC、LHBT、IGHL、RIPI、GHOA），"
     "分别对应各病种关键层面的影像信息。"
+)
+
+# V2: 17 tokens (3 global + 7 local + 7 ROI box summary)
+VISUAL_SLOT_DESC_ROI = (
+    "你将接收到17个视觉特征槽位，前3个是全局特征"
+    "（矢状位、冠状位、轴位），接着7个是病种专属局部特征"
+    "（SST、IST、SSC、LHBT、IGHL、RIPI、GHOA对应各病种关键层面），"
+    "最后7个是对应病种的2D ROI定位特征（包含目标区域位置与置信度信息）。"
 )
 
 TASK_MESSAGES = {
@@ -48,7 +57,7 @@ TASK_MESSAGES = {
                 "你是一位专业的肩关节MRI影像诊断AI助手。"
                 "你将根据MRI影像特征，输出完整的结构化诊断链，"
                 "包括病种标签、影像学证据、锚定序列、关键层面、"
-                "结构化影像学所见和结构化影像学印象。"
+                "视觉定位信息、结构化影像学所见和结构化影像学印象。"
                 + VISUAL_SLOT_DESC +
                 "请严格以JSON格式输出。"
             ),
@@ -60,7 +69,8 @@ TASK_MESSAGES = {
                 "1. labels：每种疾病的诊断标签（1=阳性，0=阴性，-1=无法判断）\n"
                 "2. evidence：每种疾病的阳性和阴性证据文本\n"
                 "3. anchor_sequence：每种疾病最相关的MRI序列\n"
-                "4. key_slice：关键层面索引（由视觉定位模块辅助）\n"
+                "4. visual_grounding：视觉定位结果，包含key_slice（关键层面索引）"
+                "和roi_box_2d（2D归一化检测框[x1,y1,x2,y2]，无则为null）\n"
                 "5. structured_findings：结构化影像学所见（句子列表）\n"
                 "6. structured_impression：结构化影像学印象（句子列表）\n"
                 f"疾病列表：{DISEASE_LIST_ZH}"

@@ -1,0 +1,75 @@
+# G4 Grounded Swin3D-Tiny + Key-slice + 2D ROI grounding
+# Builds on g3 by adding ROIBoxHead2D trained with SmoothL1 + confidence loss
+# Requires grounding_targets.json (from scripts/build_grounding_targets.py)
+
+data:
+  data_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
+  json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
+  nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
+
+  use_cache: true
+  cache_mode: loc
+  cache_root: outputs_clean/cache_loc
+  load_dense_masks: false
+  load_roi_targets: true
+  grounding_target_path: outputs_clean/grounding/grounding_targets.json
+
+  sequences:
+    - axial_PD
+    - coronal_PD
+    - coronal_T2WI
+    - sagittal_PD
+    - sagittal_T1WI
+
+  diseases:
+    - SST
+    - IST
+    - SSC
+    - LHBT
+    - IGHL
+    - RIPI
+    - GHOA
+
+model:
+  name: "swin_copas_grounded_roi"
+  encoder: "swin3d_tiny"
+  pretrained: false
+
+  use_localizer: true
+  localizer_mode: "key_slice"
+  use_roi_head: true
+
+training:
+  num_classes: 2
+
+  batch_size: 4
+  num_workers: 0
+  max_epochs: 50
+  learning_rate: 0.0001
+
+  optimizer: "adam"
+  weight_decay: 0.0001
+  scheduler: "cosine"
+
+  loss: "bce"
+
+  patience: 15
+  dropout: 0.3
+
+  # L = L_cls + 0.3*L_branch + 0.5*L_keyslice + 0.2*L_roi
+  branch_alpha: 0.3
+  localizer_alpha: 0.5
+  roi_alpha: 0.2
+
+  # Optional: init from g3 best_model
+  # init_from: outputs_clean/experiments/g3_grounded_swin_binary_clean/best_model.pt
+
+validation:
+  val_interval: 1
+  save_best: true
+
+output:
+  exp_name: "g4_grounded_swin_roi_clean"
+  output_dir: "outputs_clean/experiments"
+  save_tokens: false
+  tokens_dir: "outputs_clean/tokens"

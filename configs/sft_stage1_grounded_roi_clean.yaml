@@ -1,0 +1,69 @@
+# Grounded SFT Stage 1 ROI (Clean): Frozen MRI-CV backbone, train Projector + Qwen LoRA
+# 17 visual tokens: 3 global (sag/cor/axi) + 7 local (disease-aware key-slice) + 7 ROI summary
+# Requires g4 checkpoint (use_roi_head=True) for roi_box_2d + roi_box_conf outputs.
+# Data includes visual_grounding.roi_box_2d from grounding_targets.json in diagnosis_chain.
+
+stage: 1
+
+# ── MRI-CV backbone (G4 with ROI head) ──
+mri_cv:
+  encoder: "swin3d_tiny"
+  checkpoint_path: "outputs_clean/experiments/g4_grounded_swin_roi_clean/best_model.pt"
+  use_localizer: true
+  use_roi_tokens: true    # enables roi_box_2d/roi_box_conf -> 7 extra ROI tokens
+  freeze: true
+
+# ── Visual Projector ──
+projector:
+  num_visual_tokens: 17   # 3 global + 7 local + 7 ROI summary
+  # ROI slot layout: slots 10-16 = SST_ROI, IST_ROI, SSC_ROI, LHBT_ROI, IGHL_ROI, RIPI_ROI, GHOA_ROI
+
+# ── LLM ──
+llm:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  model_path: "/mnt/cfs_algo_bj/models/opensource_model/Qwen/Qwen2.5-7B-Instruct"
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  lora_dropout: 0.05
+  torch_dtype: "bfloat16"
+  use_flash_attn: true
+  gradient_checkpointing: true
+
+# ── Data ──
+data:
+  cache_root: "outputs_clean/cache_loc"
+  cache_mode: "loc"
+  cache_index: "outputs_clean/cache_loc/cache_loc_index.csv"
+  max_seq_length: 2048
+
+  # Grounded data with visual_grounding.roi_box_2d (rebuilt with --grounding_targets)
+  train_jsonl:
+    - "outputs_clean/sft_data_roi/split/sft_label_binary_train.jsonl"
+    - "outputs_clean/sft_data_roi/split/sft_diagnosis_chain_train.jsonl"
+  val_jsonl:
+    - "outputs_clean/sft_data_roi/split/sft_label_binary_val.jsonl"
+    - "outputs_clean/sft_data_roi/split/sft_diagnosis_chain_val.jsonl"
+
+# ── Training ──
+training:
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  num_workers: 4
+  max_epochs: 5
+  learning_rate: 0.0002
+  weight_decay: 0.01
+  warmup_ratio: 0.03
+  max_grad_norm: 1.0
+  seed: 42
+  keyslice_alpha: 0.0   # Stage 1: backbone frozen, no key-slice aux loss
+
+# ── Validation ──
+validation:
+  val_interval: 1
+  generation_max_length: 512
+
+# ── Output ──
+output:
+  exp_name: "sft_stage1_grounded_roi_clean"
+  output_dir: "outputs_clean/sft_experiments"

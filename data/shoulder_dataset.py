@@ -47,6 +47,8 @@ class ShoulderCacheDataset(Dataset):
         project_root=None,
         min_z=32,
         load_dense_masks=False,
+        load_roi_targets=False,
+        grounding_target_path=None,
     ):
         """
         Args:
@@ -62,13 +64,34 @@ class ShoulderCacheDataset(Dataset):
                               image/labels/mask/key_slices — skips building
                               roi_boxes and localizer_mask tensors.
                               Set True only when dense mask supervision is needed.
+            load_roi_targets: if True, load precomputed 2D ROI box targets from
+                              grounding_target_path. Returns roi_box_2d_gt [7,4]
+                              and roi_box_valid [7]. Requires grounding_target_path.
+            grounding_target_path: path to grounding_targets.json (from
+                              scripts/build_grounding_targets.py).
         """
         self.cache_mode = cache_mode
         self.min_z = min_z
         self.load_dense_masks = load_dense_masks
+        self.load_roi_targets = load_roi_targets
         self.label_mapper = label_mapper
         self.raw_labels_lookup = raw_labels_lookup or {}
         self.project_root = project_root or os.getcwd()
+
+        # Load ROI grounding targets if requested
+        self.roi_targets = {}  # {exam_id: {disease: {has_target, box_2d, ...}}}
+        if load_roi_targets and grounding_target_path:
+            gt_path = grounding_target_path if os.path.isabs(grounding_target_path) \
+                else os.path.join(self.project_root, grounding_target_path)
+            if os.path.exists(gt_path):
+                import json
+                with open(gt_path, encoding="utf-8") as f:
+                    gt_list = json.load(f)
+                for entry in gt_list:
+                    self.roi_targets[entry["exam_id"]] = entry
+                print("Loaded ROI grounding targets for %d exams" % len(self.roi_targets))
+            else:
+                warnings.warn("grounding_target_path not found: %s" % gt_path)
 
         # Read index CSV
         index_name = "cache_cls_index.csv" if cache_mode == "cls" else "cache_loc_index.csv"
@@ -180,6 +203,21 @@ class ShoulderCacheDataset(Dataset):
                     if m is not None and isinstance(m, torch.Tensor):
                         sm[i, z_offset:z_offset + Z_orig] = m
                 out["localizer_mask"] = sm
+
+        # --- ROI 2D box targets (from precomputed grounding_targets.json) ---
+        if self.load_roi_targets and self.roi_targets:
+            from utils.constants import DISEASES as _DISEASES
+            exam_gt = self.roi_targets.get(exam_id, {})
+            roi_box_2d_gt = torch.zeros(7, 4, dtype=torch.float32)
+            roi_box_valid = torch.zeros(7, dtype=torch.float32)
+            for i, d in enumerate(_DISEASES):
+                d_info = exam_gt.get(d, {})
+                if d_info.get("has_target") and d_info.get("box_2d"):
+                    box = d_info["box_2d"]
+                    roi_box_2d_gt[i] = torch.tensor(box, dtype=torch.float32)
+                    roi_box_valid[i] = 1.0
+            out["roi_box_2d_gt"] = roi_box_2d_gt   # [7, 4]
+            out["roi_box_valid"]  = roi_box_valid    # [7]
 
         return out
 

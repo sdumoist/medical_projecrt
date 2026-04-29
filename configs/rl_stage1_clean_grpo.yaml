@@ -1,0 +1,63 @@
+# GRPO Stage 1: Reinforce SFT-trained model using task-specific reward signals.
+# Builds on sft_stage1_grounded_clean checkpoint.
+# Reward functions: label_binary F1, diagnosis_chain composite, findings/impression fuzzy F1
+
+# ── MRI-CV backbone ──
+mri_cv:
+  encoder: "swin3d_tiny"
+  checkpoint_path: "outputs_clean/experiments/g3_grounded_swin_binary_clean/best_model.pt"
+  use_localizer: true
+  use_roi_tokens: false   # Use 10-token layout (matches SFT stage1 grounded clean)
+  freeze: true
+
+# ── Visual Projector ──
+projector:
+  num_visual_tokens: 10   # 3 global + 7 local
+
+# ── LLM ──
+llm:
+  model_name: "Qwen/Qwen2.5-7B-Instruct"
+  model_path: "/mnt/cfs_algo_bj/models/opensource_model/Qwen/Qwen2.5-7B-Instruct"
+  lora_rank: 16
+  lora_alpha: 32
+  lora_target_modules: ["q_proj", "k_proj", "v_proj", "o_proj"]
+  lora_dropout: 0.05
+  torch_dtype: "bfloat16"
+
+# ── RL-specific ──
+rl:
+  # SFT checkpoint to initialize from (LoRA adapter directory)
+  sft_checkpoint: "outputs_clean/sft_experiments/sft_stage1_grounded_clean/best_checkpoint"
+
+  # GRPO hyperparams
+  num_generations: 4      # G: group size (completions per prompt)
+  max_new_tokens: 512     # max tokens per generation
+  temperature: 0.9        # sampling temperature
+  kl_beta: 0.01          # KL penalty weight vs reference policy
+
+# ── Data ──
+data:
+  cache_root: "outputs_clean/cache_loc"
+  cache_mode: "loc"
+  cache_index: "outputs_clean/cache_loc/cache_loc_index.csv"
+  max_seq_length: 2048
+
+  # Use same split as SFT (for fair comparison)
+  train_jsonl:
+    - "outputs_clean/sft_data/split/sft_label_binary_train.jsonl"
+    - "outputs_clean/sft_data/split/sft_diagnosis_chain_train.jsonl"
+
+# ── Training ──
+training:
+  batch_size: 1           # Per-GPU batch (effective = bs * G = 4 rollouts per step)
+  num_workers: 2
+  max_epochs: 2
+  learning_rate: 0.000005  # 5e-6 (lower than SFT)
+  weight_decay: 0.01
+  max_grad_norm: 1.0
+  seed: 42
+
+# ── Output ──
+output:
+  exp_name: "rl_grpo_stage1_clean"
+  output_dir: "outputs_clean/rl_experiments"

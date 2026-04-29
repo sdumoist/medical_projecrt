@@ -234,3 +234,183 @@ def compute_key_slice_metrics(
     results["macro_ks_top1"] = float(np.mean(top1_list)) if top1_list else 0.0
     results["macro_ks_pm1"] = float(np.mean(pm1_list)) if pm1_list else 0.0
     return results
+
+# =========================================================================
+# ROI box metrics
+# =========================================================================
+
+def compute_box_iou_2d(pred_boxes, gt_boxes):
+    """Compute IoU between predicted and ground-truth 2D boxes.
+
+    Args:
+        pred_boxes: [N, 4] numpy array, (x1, y1, x2, y2) in [0, 1]
+        gt_boxes:   [N, 4] numpy array, (x1, y1, x2, y2) in [0, 1]
+
+    Returns:
+        iou: [N] float array
+    """
+    # Intersection
+    ix1 = np.maximum(pred_boxes[:, 0], gt_boxes[:, 0])
+    iy1 = np.maximum(pred_boxes[:, 1], gt_boxes[:, 1])
+    ix2 = np.minimum(pred_boxes[:, 2], gt_boxes[:, 2])
+    iy2 = np.minimum(pred_boxes[:, 3], gt_boxes[:, 3])
+
+    inter_w = np.maximum(ix2 - ix1, 0.0)
+    inter_h = np.maximum(iy2 - iy1, 0.0)
+    inter_area = inter_w * inter_h
+
+    # Union
+    pred_area = np.maximum(pred_boxes[:, 2] - pred_boxes[:, 0], 0) * \
+                np.maximum(pred_boxes[:, 3] - pred_boxes[:, 1], 0)
+    gt_area   = np.maximum(gt_boxes[:, 2]   - gt_boxes[:, 0],   0) * \
+                np.maximum(gt_boxes[:, 3]   - gt_boxes[:, 1],   0)
+    union_area = pred_area + gt_area - inter_area + 1e-8
+
+    return inter_area / union_area
+
+
+def compute_box_metrics(pred_boxes_all, gt_boxes_all, valid_mask_all, diseases):
+    """Compute per-disease and macro box IoU / L1 metrics.
+
+    Args:
+        pred_boxes_all: [N, 7, 4] numpy array of predicted boxes
+        gt_boxes_all:   [N, 7, 4] numpy array of ground-truth boxes
+        valid_mask_all: [N, 7]    numpy array, 1.0 where gt box exists
+        diseases:       list of 7 disease names
+
+    Returns:
+        dict with per-disease and macro metrics:
+            {disease}_box_iou, {disease}_box_l1
+            {disease}_box_iou_at_03, {disease}_box_iou_at_05
+            macro_box_iou, macro_box_l1
+            macro_box_iou_at_03, macro_box_iou_at_05
+    """
+    results = {}
+    iou_list = []
+    l1_list = []
+
+    for i, disease in enumerate(diseases):
+        valid = valid_mask_all[:, i] > 0
+        if valid.sum() == 0:
+            results[disease + "_box_iou"] = 0.0
+            results[disease + "_box_l1"] = 0.0
+            results[disease + "_box_iou_at_03"] = 0.0
+            results[disease + "_box_iou_at_05"] = 0.0
+            continue
+
+        pred = pred_boxes_all[valid, i]    # [M, 4]
+        gt   = gt_boxes_all[valid, i]      # [M, 4]
+
+        iou  = compute_box_iou_2d(pred, gt)    # [M]
+        l1   = np.abs(pred - gt).mean(axis=-1)  # [M], mean over 4 coords
+
+        mean_iou = float(iou.mean())
+        mean_l1  = float(l1.mean())
+
+        results[disease + "_box_iou"] = mean_iou
+        results[disease + "_box_l1"]  = mean_l1
+        results[disease + "_box_iou_at_03"] = float((iou >= 0.3).mean())
+        results[disease + "_box_iou_at_05"] = float((iou >= 0.5).mean())
+
+        iou_list.append(mean_iou)
+        l1_list.append(mean_l1)
+
+    results["macro_box_iou"]       = float(np.mean(iou_list)) if iou_list else 0.0
+    results["macro_box_l1"]        = float(np.mean(l1_list))  if l1_list  else 0.0
+    results["macro_box_iou_at_03"] = float(np.mean(
+        [results[d + "_box_iou_at_03"] for d in diseases])) if iou_list else 0.0
+    results["macro_box_iou_at_05"] = float(np.mean(
+        [results[d + "_box_iou_at_05"] for d in diseases])) if iou_list else 0.0
+    return results
+
+
+# ── 2D Mask metrics ───────────────────────────────────────────────────────
+
+def compute_mask_dice(pred_mask, gt_mask, threshold=0.5, smooth=1e-6):
+    """Compute Dice coefficient for a single 2D binary mask pair.
+
+    Args:
+        pred_mask: ndarray [H, W] predicted probability or binary mask
+        gt_mask:   ndarray [H, W] ground-truth binary mask
+        threshold: binarization threshold for pred_mask
+        smooth:    smoothing factor
+
+    Returns:
+        dice: float in [0, 1]
+    """
+    pred_bin = (pred_mask >= threshold).astype(np.float32)
+    gt_bin   = gt_mask.astype(np.float32)
+    intersection = (pred_bin * gt_bin).sum()
+    return float((2.0 * intersection + smooth) / (pred_bin.sum() + gt_bin.sum() + smooth))
+
+
+def compute_mask_iou_2d(pred_mask, gt_mask, threshold=0.5, smooth=1e-6):
+    """Compute IoU for a single 2D binary mask pair.
+
+    Args:
+        pred_mask: ndarray [H, W]
+        gt_mask:   ndarray [H, W]
+        threshold: binarization threshold
+        smooth:    smoothing factor
+
+    Returns:
+        iou: float in [0, 1]
+    """
+    pred_bin = (pred_mask >= threshold).astype(np.float32)
+    gt_bin   = gt_mask.astype(np.float32)
+    intersection = (pred_bin * gt_bin).sum()
+    union = pred_bin.sum() + gt_bin.sum() - intersection
+    return float((intersection + smooth) / (union + smooth))
+
+
+def compute_mask_metrics(pred_masks_all, gt_masks_all, valid_mask_all, diseases,
+                         threshold=0.5):
+    """Compute per-disease and macro mask Dice and IoU.
+
+    Args:
+        pred_masks_all: ndarray [N, 7, H, W] predicted masks (probabilities or binary)
+        gt_masks_all:   ndarray [N, 7, H, W] ground-truth binary masks
+        valid_mask_all: ndarray [N, 7] float, 1.0 if this disease has a gt mask
+        diseases:       list of 7 disease names
+        threshold:      binarization threshold for predictions
+
+    Returns:
+        dict with per-disease and macro: dice, iou, iou_at_05
+    """
+    results = {}
+    dice_list = []
+    iou_list  = []
+
+    for i, disease in enumerate(diseases):
+        valid = valid_mask_all[:, i] > 0
+        if valid.sum() == 0:
+            results[disease + "_mask_dice"]      = 0.0
+            results[disease + "_mask_iou"]       = 0.0
+            results[disease + "_mask_iou_at_05"] = 0.0
+            continue
+
+        per_dice = []
+        per_iou  = []
+        for n in range(len(pred_masks_all)):
+            if not valid[n]:
+                continue
+            d = compute_mask_dice(pred_masks_all[n, i], gt_masks_all[n, i], threshold)
+            u = compute_mask_iou_2d(pred_masks_all[n, i], gt_masks_all[n, i], threshold)
+            per_dice.append(d)
+            per_iou.append(u)
+
+        mean_dice = float(np.mean(per_dice))
+        mean_iou  = float(np.mean(per_iou))
+        results[disease + "_mask_dice"]      = mean_dice
+        results[disease + "_mask_iou"]       = mean_iou
+        results[disease + "_mask_iou_at_05"] = float(np.mean(
+            [v >= 0.5 for v in per_iou]))
+
+        dice_list.append(mean_dice)
+        iou_list.append(mean_iou)
+
+    results["macro_mask_dice"]      = float(np.mean(dice_list)) if dice_list else 0.0
+    results["macro_mask_iou"]       = float(np.mean(iou_list))  if iou_list  else 0.0
+    results["macro_mask_iou_at_05"] = float(np.mean(
+        [results[d + "_mask_iou_at_05"] for d in diseases])) if iou_list else 0.0
+    return results

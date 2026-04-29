@@ -188,6 +188,9 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
         print("Split: train=%d, val=%d" % (len(train_ids), len(val_ids)))
 
         load_dense_masks = config['data'].get('load_dense_masks', False)
+        load_roi_targets = config['data'].get('load_roi_targets', False)
+        grounding_target_path = config['data'].get('grounding_target_path', None)
+
         train_dataset = ShoulderCacheDataset(
             cache_root=cache_root,
             exam_ids=train_id_set,
@@ -196,6 +199,8 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             cache_mode=cache_mode,
             project_root=project_root,
             load_dense_masks=load_dense_masks,
+            load_roi_targets=load_roi_targets,
+            grounding_target_path=grounding_target_path,
         )
         val_dataset = ShoulderCacheDataset(
             cache_root=cache_root,
@@ -205,6 +210,8 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
             cache_mode=cache_mode,
             project_root=project_root,
             load_dense_masks=load_dense_masks,
+            load_roi_targets=load_roi_targets,
+            grounding_target_path=grounding_target_path,
         )
     else:
         # Raw NIfTI mode
@@ -278,8 +285,8 @@ def create_dataloaders(config, raw_labels_lookup, project_root, is_ddp=False):
 
 def compute_total_loss(output, labels, mask, criterion, branch_alpha,
                        localizer_alpha=0.0, batch=None, use_localizer=False,
-                       num_classes=2):
-    """Compute multi-branch loss with optional localizer loss.
+                       num_classes=2, roi_alpha=0.0, mask_alpha=0.0):
+    """Compute multi-branch loss with optional localizer + ROI loss.
 
     Loss = final_loss
          + branch_alpha * (sag_loss + cor_loss + axi_loss)
@@ -331,13 +338,50 @@ def compute_total_loss(output, labels, mask, criterion, branch_alpha,
         else:
             loss_dict['localizer'] = 0.0
 
+    # ROI box loss (when use_roi_head=True and roi_box_2d_gt is in batch)
+    if roi_alpha > 0 and 'roi_box_2d' in output:
+        roi_box_gt    = batch.get("roi_box_2d_gt", None)   # [B, 7, 4]
+        roi_box_valid = batch.get("roi_box_valid",  None)  # [B, 7]
+        if roi_box_gt is not None and roi_box_valid is not None:
+            from models.roi_heads import compute_roi_loss
+            roi_loss, roi_loss_dict = compute_roi_loss(
+                output['roi_box_2d'],
+                output['roi_box_conf'],
+                roi_box_gt.to(output['roi_box_2d'].device),
+                roi_box_valid.to(output['roi_box_2d'].device),
+            )
+            total_loss = total_loss + roi_alpha * roi_loss
+            loss_dict['roi_box_reg']  = roi_loss_dict['box_reg']
+            loss_dict['roi_box_conf'] = roi_loss_dict['box_conf']
+            loss_dict['roi']          = roi_loss.item()
+        else:
+            loss_dict['roi'] = 0.0
+
+    # 2D Mask loss (when use_mask_head=True and mask_2d_gt is in batch)
+    if mask_alpha > 0 and 'mask_logits_2d' in output:
+        mask_2d_gt    = batch.get("mask_2d_gt",    None)  # [B, 7, H, W]
+        mask_2d_valid = batch.get("mask_2d_valid", None)  # [B, 7]
+        if mask_2d_gt is not None and mask_2d_valid is not None:
+            from models.mask_heads import compute_mask_loss
+            mask_loss, mask_loss_dict = compute_mask_loss(
+                output['mask_logits_2d'],
+                mask_2d_gt.to(output['mask_logits_2d'].device),
+                mask_2d_valid.to(output['mask_logits_2d'].device),
+            )
+            total_loss = total_loss + mask_alpha * mask_loss
+            loss_dict['mask_bce'] = mask_loss_dict['mask_bce']
+            loss_dict['mask']     = mask_loss.item()
+        else:
+            loss_dict['mask'] = 0.0
+
     loss_dict['total'] = total_loss.item()
     return total_loss, loss_dict
 
 
 def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                 mode="train", localizer_alpha=0.0, use_localizer=False,
-                num_classes=2, scaler=None, amp_dtype=torch.bfloat16):
+                num_classes=2, scaler=None, amp_dtype=torch.bfloat16,
+                roi_alpha=0.0, mask_alpha=0.0):
     """Train or validate for one epoch."""
     model.train() if mode == "train" else model.eval()
 
@@ -346,6 +390,10 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
     loss_keys = ['total', 'final', 'sag', 'cor', 'axi']
     if use_localizer:
         loss_keys.append('localizer')
+    if roi_alpha > 0:
+        loss_keys += ['roi', 'roi_box_reg', 'roi_box_conf']
+    if mask_alpha > 0:
+        loss_keys += ['mask', 'mask_bce']
     total_losses = {k: 0.0 for k in loss_keys}
     all_preds = []
     all_probs = []
@@ -391,6 +439,8 @@ def train_epoch(model, loader, optimizer, criterion, device, branch_alpha,
                     batch=batch,
                     use_localizer=use_localizer,
                     num_classes=num_classes,
+                    roi_alpha=roi_alpha,
+                    mask_alpha=mask_alpha,
                 )
 
             # One-time debug for localizer
@@ -580,8 +630,14 @@ def train(config, output_dir):
     # Localizer settings
     use_localizer = config['model'].get('use_localizer', False)
     localizer_alpha = config['training'].get('localizer_alpha', 0.0)
+    roi_alpha = config['training'].get('roi_alpha', 0.0)
+    mask_alpha = config['training'].get('mask_alpha', 0.0)
     if use_localizer and is_main_process():
         print("Localizer enabled: alpha=%.3f" % localizer_alpha)
+    if roi_alpha > 0 and is_main_process():
+        print("ROI head enabled: alpha=%.3f" % roi_alpha)
+    if mask_alpha > 0 and is_main_process():
+        print("Mask head enabled: alpha=%.3f" % mask_alpha)
 
     # Task mode
     num_classes = config['training'].get('num_classes', 2)
@@ -602,6 +658,9 @@ def train(config, output_dir):
         branch_alpha=branch_alpha,
         use_localizer=use_localizer,
         num_classes=num_classes,
+        use_roi_head=config['model'].get('use_roi_head', False),
+        use_mask_head=config['model'].get('use_mask_head', False),
+        mask_output_size=tuple(config['model'].get('mask_output_size', [56, 56])),
     )
     model = model.to(device)
 
@@ -674,7 +733,8 @@ def train(config, output_dir):
         train_metrics = train_epoch(
             model, train_loader, optimizer, criterion, device, branch_alpha,
             "train", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
-            num_classes=num_classes, scaler=scaler, amp_dtype=amp_dtype)
+            num_classes=num_classes, scaler=scaler, amp_dtype=amp_dtype,
+            roi_alpha=roi_alpha, mask_alpha=mask_alpha)
 
         if (epoch + 1) % config['validation']['val_interval'] == 0:
             # ── Validation: ALL ranks run val subset (via DistributedSampler) ──
@@ -684,7 +744,8 @@ def train(config, output_dir):
             local_val = train_epoch(
                 raw_model, val_loader, optimizer, criterion, device, branch_alpha,
                 "val", localizer_alpha=localizer_alpha, use_localizer=use_localizer,
-                num_classes=num_classes, scaler=None, amp_dtype=amp_dtype)
+                num_classes=num_classes, scaler=None, amp_dtype=amp_dtype,
+                roi_alpha=roi_alpha, mask_alpha=mask_alpha)
 
             # Gather across ranks; returns full metrics on rank 0, None elsewhere
             val_metrics = ddp_gather_val_metrics(

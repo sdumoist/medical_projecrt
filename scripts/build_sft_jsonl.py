@@ -137,16 +137,24 @@ def build_label_binary_output(case_data):
     return json.dumps(result, ensure_ascii=False)
 
 
-def build_diagnosis_chain_output(case_data, loc_data=None):
+def build_diagnosis_chain_output(case_data, loc_data=None, grounding_targets=None,
+                                  exam_id=None):
     """Build output string for diagnosis_chain task.
 
-    Grounded v1: includes labels, evidence, anchor_sequence, key_slice,
-    structured_findings, and structured_impression.
-    roi_box removed (deferred to v2).
+    Grounded v1: labels, evidence, anchor_sequence, visual_grounding
+                 (key_slice + roi_box_2d), structured_findings, structured_impression.
+
+    visual_grounding schema per disease:
+        {
+          "key_slice": int or null,          # from cache_loc key_slices
+          "roi_box_2d": [x1,y1,x2,y2] or null  # from grounding_targets.json (V2)
+        }
 
     Args:
         case_data: dict from case JSON
         loc_data: dict with 'key_slices' from cache_loc .pt
+        grounding_targets: dict {exam_id: {disease: {has_target, box_2d}}}
+        exam_id: used to look up grounding_targets
     """
     labels = case_data.get("labels", {})
     evidence_text = case_data.get("evidence_text", {})
@@ -156,10 +164,15 @@ def build_diagnosis_chain_output(case_data, loc_data=None):
         "labels": {},
         "evidence": {},
         "anchor_sequence": {},
-        "key_slice": {},
+        "visual_grounding": {},
         "structured_findings": case_data.get("structured_findings", []),
         "structured_impression": case_data.get("structured_impression", []),
     }
+
+    # Grounding targets for this exam (V2 ROI boxes)
+    exam_gt = {}
+    if grounding_targets and exam_id:
+        exam_gt = grounding_targets.get(exam_id, {})
 
     for d in DISEASES:
         raw_label = labels.get(d, -1)
@@ -172,13 +185,22 @@ def build_diagnosis_chain_output(case_data, loc_data=None):
 
         result["anchor_sequence"][d] = DISEASE_ANCHOR_SEQ.get(d, "unknown")
 
-        # key_slice from cache_loc
+        # Visual grounding: key_slice from cache_loc, roi_box_2d from grounding_targets
+        ks_val = None
         if loc_data:
             ks = loc_data.get("key_slices", {})
-            ks_val = ks.get(d)
-            result["key_slice"][d] = ks_val if ks_val is not None and ks_val >= 0 else None
-        else:
-            result["key_slice"][d] = None
+            v = ks.get(d)
+            ks_val = v if v is not None and v >= 0 else None
+
+        roi_box_2d = None
+        d_info = exam_gt.get(d, {})
+        if d_info.get("has_target") and d_info.get("box_2d"):
+            roi_box_2d = d_info["box_2d"]
+
+        result["visual_grounding"][d] = {
+            "key_slice": ks_val,
+            "roi_box_2d": roi_box_2d,
+        }
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -198,10 +220,10 @@ def build_structured_impression_output(case_data):
 
 
 OUTPUT_BUILDERS = {
-    "label_binary": lambda cd, ld: build_label_binary_output(cd),
-    "diagnosis_chain": lambda cd, ld: build_diagnosis_chain_output(cd, ld),
-    "structured_findings": lambda cd, ld: build_structured_findings_output(cd),
-    "structured_impression": lambda cd, ld: build_structured_impression_output(cd),
+    "label_binary": lambda cd, ld, gt, eid: build_label_binary_output(cd),
+    "diagnosis_chain": lambda cd, ld, gt, eid: build_diagnosis_chain_output(cd, ld, gt, eid),
+    "structured_findings": lambda cd, ld, gt, eid: build_structured_findings_output(cd),
+    "structured_impression": lambda cd, ld, gt, eid: build_structured_impression_output(cd),
 }
 
 
@@ -296,6 +318,7 @@ def build_sft_jsonl(args):
     task_types = args.task_types
     cache_loc_root = args.cache_loc_root
     cache_loc_index_path = args.cache_loc_index
+    grounding_target_path = getattr(args, "grounding_targets", None)
 
     project_root = PROJECT_ROOT
     os.makedirs(output_dir, exist_ok=True)
@@ -303,6 +326,20 @@ def build_sft_jsonl(args):
     # Load cache_loc index
     cache_loc_index = load_cache_loc_index(cache_loc_index_path, project_root)
     print("Loaded cache_loc index: %d entries" % len(cache_loc_index))
+
+    # Load grounding targets (V2 ROI boxes)
+    grounding_targets = {}
+    if grounding_target_path:
+        gt_path = grounding_target_path if os.path.isabs(grounding_target_path) \
+            else os.path.join(project_root, grounding_target_path)
+        if os.path.exists(gt_path):
+            with open(gt_path, encoding="utf-8") as f:
+                gt_list = json.load(f)
+            for entry in gt_list:
+                grounding_targets[entry["exam_id"]] = entry
+            print("Loaded grounding targets for %d exams" % len(grounding_targets))
+        else:
+            print("WARNING: grounding_targets not found at %s" % gt_path)
 
     # Scan all case JSONs
     json_files = sorted(glob.glob(os.path.join(json_root, "*.json")))
@@ -385,6 +422,11 @@ def build_sft_jsonl(args):
         if loc_data and any(v is not None and len(v) > 0
                             for v in loc_data.get("roi_boxes", {}).values()):
             stats["field_completeness"]["roi_available"] += 1
+        if grounding_targets.get(exam_id):
+            gt_entry = grounding_targets[exam_id]
+            if any(gt_entry.get(d, {}).get("has_target") for d in DISEASES):
+                stats["field_completeness"]["roi_box_2d_available"] = \
+                    stats["field_completeness"].get("roi_box_2d_available", 0) + 1
         if len(case_data.get("structured_findings", [])) > 0:
             stats["field_completeness"]["findings_nonempty"] += 1
         if len(case_data.get("structured_impression", [])) > 0:
@@ -416,7 +458,7 @@ def build_sft_jsonl(args):
                 continue
 
             # Build output
-            output_str = OUTPUT_BUILDERS[tt](case_data, loc_data)
+            output_str = OUTPUT_BUILDERS[tt](case_data, loc_data, grounding_targets, exam_id)
 
             # Build instruction (plain text for storage)
             instruction = build_prompt_plain(tt)
@@ -488,6 +530,9 @@ def main():
                         help="Root directory for cache_loc .pt files")
     parser.add_argument("--cache_loc_index", default=None,
                         help="Path to cache_loc_index.csv")
+    parser.add_argument("--grounding_targets", default=None,
+                        help="Path to grounding_targets.json (from build_grounding_targets.py). "
+                             "When provided, roi_box_2d is included in diagnosis_chain output.")
 
     args = parser.parse_args()
     build_sft_jsonl(args)

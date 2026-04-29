@@ -127,6 +127,24 @@ class ShoulderCoPASModel(nn.Module):
             self.local_token_pooler = SoftAttentionLocalTokenPooler(
                 temperature=1.0)
 
+        # --- ROI box head (depends on local_tokens, requires use_localizer) ---
+        self.use_roi_head = kwargs.get("use_roi_head", False)
+        if self.use_roi_head:
+            if not use_localizer:
+                raise ValueError("use_roi_head=True requires use_localizer=True")
+            from models.roi_heads import ROIBoxHead2D
+            self.roi_head = ROIBoxHead2D(feat_dim, dropout=dropout)
+
+        # --- 2D Mask head (depends on local_tokens, requires use_localizer) ---
+        self.use_mask_head = kwargs.get("use_mask_head", False)
+        if self.use_mask_head:
+            if not use_localizer:
+                raise ValueError("use_mask_head=True requires use_localizer=True")
+            from models.mask_heads import MaskHead2D
+            mask_output_size = kwargs.get("mask_output_size", (56, 56))
+            self.mask_head = MaskHead2D(
+                feat_dim, output_size=mask_output_size, dropout=dropout)
+
     def _encode_slice(self, x, seq_name):
         """Encode a single sequence to per-slice features [B, D', C]."""
         return self.encoders[seq_name].forward_slice(x)
@@ -210,12 +228,25 @@ class ShoulderCoPASModel(nn.Module):
             result['slice_logits'] = slice_logits
             result['local_tokens'] = local_tokens
 
+            # === ROI box head (2D box on key-slice plane) ===
+            if self.use_roi_head:
+                roi_box_2d, roi_box_conf = self.roi_head(local_tokens)
+                result['roi_box_2d'] = roi_box_2d    # [B, 7, 4]
+                result['roi_box_conf'] = roi_box_conf # [B, 7]
+
+            # === 2D Mask head (binary mask on key-slice plane) ===
+            if self.use_mask_head:
+                mask_logits, mask_probs = self.mask_head(local_tokens)
+                result['mask_logits_2d'] = mask_logits  # [B, 7, H, W]
+                result['mask_probs_2d']  = mask_probs   # [B, 7, H, W]
+
         return result
 
 
 def create_model(encoder="resnet3d_18", num_diseases=7, pretrained=False,
                  dropout=0.3, num_heads=4, branch_alpha=0.3,
-                 use_localizer=False, num_classes=2, **kwargs):
+                 use_localizer=False, num_classes=2, use_roi_head=False,
+                 use_mask_head=False, mask_output_size=(56, 56), **kwargs):
     """Create ShoulderCoPASModel from config."""
     return ShoulderCoPASModel(
         encoder_name=encoder,
@@ -226,5 +257,8 @@ def create_model(encoder="resnet3d_18", num_diseases=7, pretrained=False,
         branch_alpha=branch_alpha,
         use_localizer=use_localizer,
         num_classes=num_classes,
+        use_roi_head=use_roi_head,
+        use_mask_head=use_mask_head,
+        mask_output_size=mask_output_size,
         **kwargs,
     )

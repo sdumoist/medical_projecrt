@@ -1,0 +1,78 @@
+# G5 Grounded Swin3D-Tiny + Key-slice + 2D ROI + 2D Mask grounding
+# Builds on g4 by adding MaskHead2D trained on key-slice 2D binary masks
+# GT masks: downsampled from nnUNet 3D segmentation to key-slice 2D plane
+
+data:
+  data_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/data/Shoulder/RightData"
+  json_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/shouder/final_output/to_extract/case_json"
+  nnunet_root: "/mnt/cfs_algo_bj/models/experiments/lirunze/code/nnUNet/output"
+
+  use_cache: true
+  cache_mode: loc
+  cache_root: outputs_clean/cache_loc
+  load_dense_masks: true    # needed for 2D mask GT
+  load_roi_targets: true
+  grounding_target_path: outputs_clean/grounding/grounding_targets.json
+
+  sequences:
+    - axial_PD
+    - coronal_PD
+    - coronal_T2WI
+    - sagittal_PD
+    - sagittal_T1WI
+
+  diseases:
+    - SST
+    - IST
+    - SSC
+    - LHBT
+    - IGHL
+    - RIPI
+    - GHOA
+
+model:
+  name: "swin_copas_grounded_roi_mask"
+  encoder: "swin3d_tiny"
+  pretrained: false
+
+  use_localizer: true
+  localizer_mode: "key_slice"
+  use_roi_head: true
+  use_mask_head: true       # NEW: enable MaskHead2D
+  mask_output_size: [56, 56]  # 2D mask resolution
+
+  # Optional: init from g4 best_model
+  # init_from: outputs_clean/experiments/g4_grounded_swin_roi_clean/best_model.pt
+
+training:
+  num_classes: 2
+
+  batch_size: 4
+  num_workers: 0
+  max_epochs: 50
+  learning_rate: 0.0001
+
+  optimizer: "adam"
+  weight_decay: 0.0001
+  scheduler: "cosine"
+
+  loss: "bce"
+
+  patience: 15
+  dropout: 0.3
+
+  # L = L_cls + 0.3*L_branch + 0.5*L_keyslice + 0.2*L_roi + 0.1*L_mask
+  branch_alpha: 0.3
+  localizer_alpha: 0.5
+  roi_alpha: 0.2
+  mask_alpha: 0.1           # NEW: 2D mask loss weight
+
+validation:
+  val_interval: 1
+  save_best: true
+
+output:
+  exp_name: "g5_grounded_swin_mask2d_clean"
+  output_dir: "outputs_clean/experiments"
+  save_tokens: false
+  tokens_dir: "outputs_clean/tokens"
